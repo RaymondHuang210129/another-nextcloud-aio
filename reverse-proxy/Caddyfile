@@ -1,0 +1,62 @@
+{
+    # Used for ACME notices, rate-limit exemptions, etc.
+    email {$CADDY_EMAIL}
+    auto_https disable_redirects
+}
+
+{$FQDN} {
+    # Force TLS-ALPN-01 on 443 as some ISPs block 80.
+    tls {
+        issuer acme {
+            disable_http_challenge
+        }
+    }
+
+    # Nice compression for static assets
+    encode zstd gzip
+
+    # Security headers
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        Referrer-Policy "no-referrer"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        # Hide server banner from responses
+        -Server
+    }
+
+    # Main routing logic to ensure specific paths are handled first
+    route {
+        # --- 1. Handle Talk HPB on its specific path ---
+        # Match both /standalone-signaling and any subpaths
+        @talk path /standalone-signaling*
+        handle @talk {
+            # Strip the prefix so HPB sees the internal paths like /spreed, /api/...
+            uri strip_prefix /standalone-signaling
+
+            # Proxy to the HPB container, which handles WebSocket upgrades automatically
+            reverse_proxy spreed-backend:8081 {
+                header_up Host {host}
+                header_up X-Forwarded-Proto {scheme}
+                header_up X-Forwarded-For {remote_host}
+            }
+        }
+
+        # --- 2. Handle Nextcloud's required redirects ---
+        @dav path /.well-known/carddav /.well-known/caldav
+        redir @dav /remote.php/dav 301
+        redir /.well-known/webfinger /index.php/.well-known/webfinger 301
+        redir /.well-known/nodeinfo  /index.php/.well-known/nodeinfo  301
+
+        # --- 3. Handle all other traffic as the default ---
+        # This is the fallback for the main Nextcloud application
+        handle {
+            reverse_proxy app:80 {
+                header_up Host {host}
+                header_up X-Forwarded-Proto {scheme}
+                header_up X-Forwarded-For {remote_host}
+            }
+        }
+    }
+}

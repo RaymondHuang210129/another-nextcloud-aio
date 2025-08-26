@@ -1,0 +1,273 @@
+services:
+  app:
+    image: docker.io/library/nextcloud:31.0.8-apache
+    container_name: nextcloud
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      caddy:
+        condition: service_started
+      noip:
+        condition: service_started
+    environment:
+      FQDN: "${FQDN}"
+      NEXTCLOUD_ADMIN_USER: "${NEXTCLOUD_ADMIN_USER}"
+      NEXTCLOUD_ADMIN_PASSWORD: "${NEXTCLOUD_ADMIN_PASSWORD}"
+      NEXTCLOUD_TRUSTED_DOMAINS: "${FQDN}"
+      TRUSTED_PROXIES: "10.89.0.0/24"
+      OVERWRITEPROTOCOL: "https"
+      NEXTCLOUD_DATA_DIR: /var/www/html/data
+      PHP_MEMORY_LIMIT: 16384M
+      PHP_UPLOAD_LIMIT: 32768M
+      REDIS_HOST: redis
+      POSTGRES_HOST: "db"
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      NC_maintenance_window_start: "1"
+      NC_default_phone_region: "US"
+      NC_dbuser: "${POSTGRES_USER}"
+      NC_dbpassword: "${POSTGRES_PASSWORD}"
+    ports:
+      - 8080:80
+    restart: always
+    volumes:
+      - ../data:/var/www/html/data:rw
+      - ../nextcloud/html:/var/www/html:rw
+      - ../nextcloud/apps:/var/www/html/custom_apps:rw
+      - ../nextcloud/themes:/var/www/html/themes:rw
+      - ../nextcloud/container-hooks/before-starting:/docker-entrypoint-hooks.d/before-starting:ro
+    x-podman.uidmaps:
+      - "+33:@${HOST_UID}:1"
+      - "0:1:1"
+    x-podman.gidmaps:
+      - "+33:@${HOST_GID}:1"
+      - "0:1:1"
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  app-cron:
+    image: docker.io/library/nextcloud:31.0.8-apache
+    container_name: nextcloud-cron
+    depends_on:
+      - app
+    environment:
+      FQDN: "${FQDN}"
+      NEXTCLOUD_ADMIN_USER: "${NEXTCLOUD_ADMIN_USER}"
+      NEXTCLOUD_ADMIN_PASSWORD: "${NEXTCLOUD_ADMIN_PASSWORD}"
+      NEXTCLOUD_TRUSTED_DOMAINS: "${FQDN}"
+      TRUSTED_PROXIES: "10.89.0.0/24"
+      OVERWRITEPROTOCOL: "https"
+      NEXTCLOUD_DATA_DIR: /var/www/html/data
+      PHP_MEMORY_LIMIT: 16384M
+      PHP_UPLOAD_LIMIT: 32768M
+      REDIS_HOST: redis
+      POSTGRES_HOST: "db"
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      NC_maintenance_window_start: "1"
+      NC_default_phone_region: "US"
+      NC_dbuser: "${POSTGRES_USER}"
+      NC_dbpassword: "${POSTGRES_PASSWORD}"
+    restart: unless-stopped
+    command: ["/cron.sh"]
+    volumes:
+      - ../data:/var/www/html/data:rw
+      - ../nextcloud/html:/var/www/html:rw
+      - ../nextcloud/apps:/var/www/html/custom_apps:rw
+      - ../nextcloud/themes:/var/www/html/themes:rw
+    x-podman.uidmaps:
+      - "+33:@${HOST_UID}:1"
+      - "0:1:1"
+    x-podman.gidmaps:
+      - "+33:@${HOST_GID}:1"
+      - "0:1:1"
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  db:
+    image: docker.io/library/postgres:17  
+    container_name: nextcloud-db
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+      TZ: "UTC"
+      LANG: "C.UTF-8"
+    restart: always
+    user: "999:999"
+    volumes:
+      - ../db/data:/var/lib/postgresql/data:rw
+    x-podman.uidmaps:
+      - "+999:@${HOST_UID}:1"
+      - "0:1:1"
+    x-podman.gidmaps:
+      - "+999:@${HOST_GID}:1"
+      - "0:1:1"
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" -h 127.0.0.1 -p 5432"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+  redis:
+    image: docker.io/library/redis:8.2.1-alpine
+    container_name: nextcloud-redis
+    restart: always
+    command: ["redis-server","--appendonly", "yes"]
+    volumes:
+      - ../redis:/data:rw
+    x-podman.uidmaps:
+      - "+999:@${HOST_UID}:1"
+      - "0:1:1"
+    x-podman.gidmaps:
+      - "+999:@${HOST_GID}:1"
+      - "0:1:1"
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  caddy:
+    image: docker.io/library/caddy:2.10.0
+    container_name: nextcloud-caddy
+    environment:
+      FQDN: "${FQDN}"
+      CADDY_EMAIL: "${CADDY_EMAIL}"
+    ports:
+      - 443:443
+    restart: always
+    volumes:
+      - ../reverse-proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../reverse-proxy/caddy_data:/data:rw
+      - ../reverse-proxy/caddy_config:/config:rw
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${FQDN}/${FQDN}.crt && test -f /data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${FQDN}/${FQDN}.key"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+  coturn:
+    image: docker.io/coturn/coturn:4.7
+    container_name: nextcloud-coturn
+    depends_on:
+      caddy:
+        condition: service_healthy
+    restart: always
+    network_mode: host
+    user: "0"
+    environment:
+      DETECT_EXTERNAL_IP: "yes"
+    entrypoint:
+      - /bin/bash
+      - -lc
+      - |
+        until [ -f /caddy/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${FQDN}/${FQDN}.crt ] && [ -f /caddy/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${FQDN}/${FQDN}.key ]; do
+          echo "wait for certificate to be issued..."
+          sleep 2
+        done
+        exec turnserver
+          --realm=${FQDN}
+          --static-auth-secret=${TURN_SECRET}
+          --use-auth-secret
+          --tls-listening-port=5349
+          --listening-port=3478
+          --min-port=49160
+          --max-port=49200
+          --cert=/caddy/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${FQDN}/${FQDN}.crt
+          --pkey=/caddy/caddy_data/caddy/certificates/acme-v02.api.letsencrypt.org-directory/${FQDN}/${FQDN}.key
+          --fingerprint
+    volumes:
+      - ../reverse-proxy:/caddy:ro
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  noip:
+    image: docker.io/noipcom/noip-duc:3.3.0
+    container_name: nextcloud-noip
+    restart: always
+    environment:
+      NOIP_USERNAME: "${NOIP_USERNAME}"
+      NOIP_PASSWORD: "${NOIP_PASSWORD}"
+      NOIP_HOSTNAMES: "${FQDN}"
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  imaginary:
+    image: ghcr.io/nextcloud-releases/aio-imaginary:latest
+    container_name: nextcloud-imaginary
+    depends_on:
+      - app
+    restart: always
+    cap_add:
+      - SYS_NICE
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  spreed-backend:
+    image: docker.io/strukturag/nextcloud-spreed-signaling:2.0.4
+    container_name: nextcloud-spreed-backend
+    restart: always
+    depends_on:
+      nats:
+        condition: service_started
+      janus:
+        condition: service_started
+      coturn:
+        condition: service_started
+    environment:
+      HTTP_LISTEN: "0.0.0.0:8081"
+      TRUSTED_PROXIES: "10.89.0.0/24"
+      HASH_KEY: "${SESSION_HASH_KEY}"
+      BLOCK_KEY: "${SESSION_BLOCK_KEY}"
+      INTERNAL_SHARED_SECRET_KEY: "${INTERNAL_SECRET}"
+      BACKENDS: "BACKEND_1"
+      BACKEND_BACKEND_1_URLS: "https://${FQDN}"
+      BACKEND_BACKEND_1_SHARED_SECRET: "${SIGNALING_SECRET}"
+      NATS_URL: "nats://nats:4222"
+      USE_JANUS: "true"
+      JANUS_URL: "ws://janus:8188"
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  nats:
+    image: docker.io/library/nats:2.11.8
+    container_name: nextcloud-nats
+    restart: always
+    command: ["-p", "4222"]
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  janus:
+    build: ../janus/
+    container_name: nextcloud-janus
+    command: ["janus", "--full-trickle", "--rtp-port-range=40000-40100", "--nat-1-1=$LAN_IP"]
+    restart: always
+    ports:
+      - "40000-40100:40000-40100/udp"
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+networks:
+  nextcloud_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.89.0.0/24
+        - gateway: 10.89.0.1
+        - subnet: fd00:1::/64
+        - gateway: fd00:1::1
