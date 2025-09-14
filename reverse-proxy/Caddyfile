@@ -43,13 +43,29 @@
             }
         }
 
-        # --- 2. Handle Nextcloud's required redirects ---
+        # --- 2. Handle Collabora on its specific path ---
+        @collabora path /collabora*
+        handle @collabora {
+            # Translate legacy /lool/* → /cool/* for compatibility
+            @lool path /lool*
+            handle @lool {
+                uri replace /lool /cool
+            }
+
+            reverse_proxy nextcloud-collabora:9980 {
+                header_up Host {host}
+                header_up X-Forwarded-Proto {scheme}
+                header_up X-Forwarded-For {remote_host}
+            }
+        }
+
+        # --- 3. Handle Nextcloud's required redirects ---
         @dav path /.well-known/carddav /.well-known/caldav
         redir @dav /remote.php/dav 301
         redir /.well-known/webfinger /index.php/.well-known/webfinger 301
         redir /.well-known/nodeinfo  /index.php/.well-known/nodeinfo  301
 
-        # --- 3. Handle all other traffic as the default ---
+        # --- 4. Handle all other traffic as the default ---
         # This is the fallback for the main Nextcloud application
         handle {
             reverse_proxy app:80 {

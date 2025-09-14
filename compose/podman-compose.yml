@@ -262,6 +262,19 @@ services:
       - nextcloud_network
     extra_hosts:
       - "${FQDN}:${LAN_IP}"
+  collabora:
+    image: docker.io/collabora/code:25.04.5.1.1
+    container_name: nextcloud-collabora
+    environment:
+      - aliasgroup1=https://${FQDN}:443
+      - extra_params=--o:net.service_root=/collabora --o:ssl.enable=false --o:ssl.termination=true
+    restart: always
+    cap_add:
+      - MKNOD
+    networks:
+      - nextcloud_network
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
 networks:
   nextcloud_network:
     driver: bridge

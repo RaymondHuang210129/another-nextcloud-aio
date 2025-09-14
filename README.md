@@ -31,6 +31,7 @@ podman-compose up -d
 7. [Service Overview](#service-overview)
 8. [Supported Apps with Extra Configuration](#supported-apps-with-extra-configuration)
    - [Talk (HPB + TURN)](#talk-hpb--turn)
+   - [Nextcloud Office (Collabora)](#nextcloud-office)
 9. [Troubleshooting](#troubleshooting)
 10. [Security Notes](#security-notes)
 11. [FAQ](#faq)
@@ -59,6 +60,7 @@ podman-compose up -d
 - **noip**: Dynamic update client for your DDNS domain.
 - **imaginary**: Fast image preview generation.
 - **spreed-backend**, **nats**, **janus**, **coturn**: Various Nextcloud Talk backend for enabling chats, calls, and video conferencing everywhere.
+- **collabora**: Nextcloud Office interation (docx, pttx, xlsx).
 
 ---
 
@@ -162,7 +164,7 @@ These are the apps that typically need more than one click to work well in a hom
 
 **In Nextcloud → Admin Settings → Talk → High-Performance Backend:**
 
-- **High-Performance Backend**:  
+- **High-Performance Backend setting**:  
    - **URL**: `wss://<DOMAIN>/standalone-signaling`
    - **Enable SSL**: ✅ (handled by the reverse proxy)
    - **Shared secret**: `SIGNAL_SECRET` (must match the signaling container)
@@ -170,6 +172,18 @@ These are the apps that typically need more than one click to work well in a hom
 - **TURN server**:  
   - `turn only, <DOMAIN>:3478`
   - TURN secret, paste the secret you set in .env file
+
+### Nextcloud Office
+
+**Patch richdocument app to support subpath**:
+- In `nextcloud/apps/richdocuments/lib/Service/ConnectivityService.php`, replace `$detectedUrl` variable assignment in `autoConfigurePublicUrl` function as follow:
+   ```php
+   $pos = \strpos($determinedUrl, '/browser');
+   $detectedUrl = \rtrim(\substr($determinedUrl, 0, $pos), '/');
+   ```
+**In Nextcloud → Admin Settings → Office**:
+- Select `Use your own server`
+- **URL**: `https://<Your Domain Name>/collabora`
 
 ---
 
