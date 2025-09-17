@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+
+# This is a wrapper script around ffmpeg to convert go-vod program's ffmpeg invocations
+# into the pure GPU-accelerated zero-copy CUDA/NVENC/NVDEC paths.
+# It also adds some sane defaults for HLS streaming with Memories.
+
+set -euo pipefail
+
+REAL=/usr/local/bin/ffmpeg.real
+args=( "$@" )
+
+# ---------- helpers ----------
+# Find the first output URL; in your flow it’s a single "-" at the end.
+index_of_output() {
+  for ((i=0;i<${#args[@]};i++)); do
+    [[ "${args[i]}" == "-" ]] && { echo "$i"; return 0; }
+  done
+  echo "${#args[@]}"
+}
+insert_before_output() {
+  local -n arr=$1; shift
+  local out_idx; out_idx=$(index_of_output)
+  local head=( "${arr[@]:0:out_idx}" )
+  local tail=( "${arr[@]:out_idx}" )
+  arr=( "${head[@]}" "$@" "${tail[@]}" )
+}
+# Fix a single -vf/-filter:v string (zero-copy GPU path)
+fix_vf() {
+  local vf="$1"
+  # remove bogus CPU→GPU bits
+  vf="${vf//format=nv12|cuda,hwupload,/}"
+  vf="${vf//format=nv12|cuda,/}"
+  vf="${vf//,hwupload,/,}"
+  vf="${vf//,hwupload/}"
+  # ensure scale_cuda contains :format=nv12 (GPU-side)
+  if [[ "$vf" == *"scale_cuda="* ]] && ! [[ "$vf" =~ scale_cuda=.*format= ]]; then
+    vf="${vf/scale_cuda=/scale_cuda=format=nv12:}"
+  fi
+  printf '%s' "$vf"
+}
+# -----------------------------
+
+# 1) Ensure zero-copy decode: prepend input options (SAFE)
+has_outfmt=false
+for ((i=0;i<${#args[@]}-1;i++)); do
+  [[ "${args[i]}" == "-hwaccel_output_format" && "${args[i+1]}" == "cuda" ]] && { has_outfmt=true; break; }
+done
+if ! $has_outfmt; then
+  # Put them at the very beginning so they apply to inputs (not output)
+  args=( -hwaccel cuda -hwaccel_output_format cuda "${args[@]}" )
+fi
+
+# 2) Clean up -vf strings and keep everything on GPU
+for ((i=0;i<${#args[@]};i++)); do
+  if [[ "${args[i]}" == "-vf" || "${args[i]}" == "-filter:v" ]]; then
+    (( i+1 < ${#args[@]} )) && args[i+1]="$(fix_vf "${args[i+1]}")"
+  fi
+done
+
+# 3) Remove timestamp troublemakers for HLS
+filtered=(); skip=false
+for ((i=0;i<${#args[@]};i++)); do
+  if $skip; then skip=false; continue; fi
+  [[ "${args[i]}" == "-copyts" ]] && continue
+  if [[ "${args[i]}" == "-fflags" && "${args[i+1]:-}" == "+genpts" ]]; then
+    skip=true; continue
+  fi
+  filtered+=( "${args[i]}" )
+done
+args=( "${filtered[@]}" )
+
+# 4) Force CFR 30 fps at encoder (OUTPUT option → insert before output)
+has_rv=false
+for ((i=0;i<${#args[@]};i++)); do
+  [[ "${args[i]}" == "-r" || "${args[i]}" == "-r:v" ]] && { has_rv=true; break; }
+done
+$has_rv || insert_before_output args -r:v 30
+
+# 5) HLS hygiene: align GOP to segment duration and make independent segments
+# read -hls_time (default 3)
+hls_time=3
+for ((i=0;i<${#args[@]}-1;i++)); do
+  if [[ "${args[i]}" == "-hls_time" ]]; then
+    hls_time="${args[i+1]%.*}"
+  fi
+done
+g=$(( 30 * hls_time ))
+
+need_g=true; need_k=true; need_sc=true; have_hls_flags=false
+for ((i=0;i<${#args[@]};i++)); do
+  [[ "${args[i]}" == "-g" ]] && need_g=false
+  [[ "${args[i]}" == "-keyint_min" ]] && need_k=false
+  [[ "${args[i]}" == "-sc_threshold" ]] && need_sc=false
+  if [[ "${args[i]}" == "-hls_flags" && $((i+1)) -lt ${#args[@]} ]]; then
+    have_hls_flags=true
+    [[ "${args[i+1]}" == *"independent_segments"* ]] || args[i+1]="${args[i+1]}+independent_segments"
+  fi
+done
+$need_g && insert_before_output args -g "$g"
+$need_k && insert_before_output args -keyint_min "$g"
+$need_sc && insert_before_output args -sc_threshold 0
+$have_hls_flags || insert_before_output args -hls_flags independent_segments
+
+# 6) Low-latency safety (if used): rc-lookahead=0
+has_tune_ll=false; rc_idx=-1
+for ((i=0;i<${#args[@]}-1;i++)); do
+  [[ "${args[i]}" == "-tune" && "${args[i+1]}" == "ll" ]] && has_tune_ll=true
+  [[ "${args[i]}" == "-rc-lookahead" ]] && rc_idx=$((i+1))
+done
+if $has_tune_ll; then
+  if (( rc_idx >= 0 )); then args[$rc_idx]=0
+  else insert_before_output args -rc-lookahead 0
+  fi
+fi
+
+# 7) Ensure HLS segment dir exists
+for ((i=0;i<${#args[@]}-1;i++)); do
+  if [[ "${args[i]}" == "-hls_segment_filename" ]]; then
+    mkdir -p -- "$(dirname -- "${args[i+1]}")" || true
+  fi
+done
+
+# Done — run the real ffmpeg
+exec "$REAL" "${args[@]}"

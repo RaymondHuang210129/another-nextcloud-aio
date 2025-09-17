@@ -32,6 +32,7 @@ podman-compose up -d
 8. [Supported Apps with Extra Configuration](#supported-apps-with-extra-configuration)
    - [Talk (HPB + TURN)](#talk-hpb--turn)
    - [Nextcloud Office (Collabora)](#nextcloud-office)
+   - [Memories](#memories)
 9. [Troubleshooting](#troubleshooting)
 10. [Security Notes](#security-notes)
 11. [FAQ](#faq)
@@ -61,6 +62,7 @@ podman-compose up -d
 - **imaginary**: Fast image preview generation.
 - **spreed-backend**, **nats**, **janus**, **coturn**: Various Nextcloud Talk backend for enabling chats, calls, and video conferencing everywhere.
 - **collabora**: Nextcloud Office interation (docx, pttx, xlsx).
+- **memories-go-vod**: Transcoder for Memories video playback.
 
 ---
 
@@ -184,6 +186,22 @@ These are the apps that typically need more than one click to work well in a hom
 **In Nextcloud → Admin Settings → Office**:
 - Select `Use your own server`
 - **URL**: `https://<Your Domain Name>/collabora`
+
+### Memories
+
+**Prerequesities**:
+- You have an Nvidia Graphic card (currently support RTX 50 series, change `compute_X` and `sm_X` to older version if you have an older card)
+- Install Nvidia CUDA driver in host system (This container uses CUDA 13.0) [link](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/)
+- Install Nvidia Container Toolkit and configure podman [link](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+
+**In Nextcloud → Admin Settings → Memories**:
+- In `Video Streaming` section, turn on `Enable Transcoding`.
+- Under `Transcoder`, turn on `Enable extrenal transcoder`.
+- Modify `Bind Address (local only)` with `nextcloud-memories-transcoder:47788`.
+- In HW Acceleration:
+   - Turn off `Enable acceleration with VA-API`.
+   - Turn on `Enable acceleration with NVENC`.
+   - Choose `CUDA scaler`
 
 ---
 

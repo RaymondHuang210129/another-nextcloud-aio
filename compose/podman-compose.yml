@@ -39,6 +39,8 @@ services:
       - ../nextcloud/apps:/var/www/html/custom_apps:rw
       - ../nextcloud/themes:/var/www/html/themes:rw
       - ../nextcloud/container-hooks/before-starting:/docker-entrypoint-hooks.d/before-starting:ro
+      - /usr/local/bin/ffmpeg:/usr/local/bin/ffmpeg:ro
+      - /usr/local/bin/ffprobe:/usr/local/bin/ffprobe:ro
     x-podman.uidmaps:
       - "+33:@${HOST_UID}:1"
       - "0:1:1"
@@ -49,6 +51,13 @@ services:
       - nextcloud_network
     extra_hosts:
       - "${FQDN}:${LAN_IP}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
   app-cron:
     image: docker.io/library/nextcloud:31.0.8-apache
     container_name: nextcloud-cron
@@ -275,6 +284,29 @@ services:
       - nextcloud_network
     extra_hosts:
       - "${FQDN}:${LAN_IP}"
+  memories-go-vod:
+    image: docker.io/radialapps/go-vod:latest
+    container_name: nextcloud-memories-transcoder
+    depends_on:
+      - app
+    init: true
+    environment:
+      - NEXTCLOUD_HOST=https://${FQDN}
+      - NEXTCLOUD_ALLOW_INSECURE=1
+      - NVIDIA_VISIBLE_DEVICES=all
+    volumes:
+      - ../nextcloud/html:/var/www/html:ro
+      - ../data:/var/www/html/data:ro
+      - ../go-vod/build-ffmpeg-nvidia.sh:/app/build-ffmpeg-nvidia.sh:ro
+      - ../go-vod/ffmpeg:/app/ffmpeg:ro
+    entrypoint: ["/app/build-ffmpeg-nvidia.sh"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 networks:
   nextcloud_network:
     driver: bridge
