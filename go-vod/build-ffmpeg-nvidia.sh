@@ -8,7 +8,11 @@ NVCC_SM_FLAGS="-gencode=arch=compute_90,code=sm_90"  # use 'sm_89' if your nvcc 
 PREFIX="/usr/local"
 # ------------------------------------
 
-rm -rf /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
+# if ffmpeg.real exists, the ffmpeg has been built already; skip
+if [[ -f "$PREFIX/bin/ffmpeg.real" ]]; then
+  echo "[*] FFmpeg with NVIDIA support already installed, skipping build."
+  exec /app/entrypoint.sh "$@"
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -81,7 +85,7 @@ ffmpeg -filters | grep -E '^ T.*scale_cuda' || true
 # Move the binary to .real so we have a wrapper script to fix the arguments
 mv $PREFIX/bin/ffmpeg $PREFIX/bin/ffmpeg.real
 
-cp /app/ffmpeg $PREFIX/bin/ffmpeg
+cp /app/ffmpeg-wrapper $PREFIX/bin/ffmpeg
 
 # Hand over to your app
 exec /app/entrypoint.sh "$@"

@@ -298,7 +298,8 @@ services:
       - ../nextcloud/html:/var/www/html:ro
       - ../data:/var/www/html/data:ro
       - ../go-vod/build-ffmpeg-nvidia.sh:/app/build-ffmpeg-nvidia.sh:ro
-      - ../go-vod/ffmpeg:/app/ffmpeg:ro
+      - ../go-vod/ffmpeg-wrapper:/app/ffmpeg-wrapper:ro
+      - ../go-vod/bin:/usr/local/bin:rw
     entrypoint: ["/app/build-ffmpeg-nvidia.sh"]
     deploy:
       resources:
