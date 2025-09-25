@@ -11,6 +11,7 @@ PREFIX="/usr/local"
 # if ffmpeg.real exists, the ffmpeg has been built already; skip
 if [[ -f "$PREFIX/bin/ffmpeg.real" ]]; then
   echo "[*] FFmpeg with NVIDIA support already installed, skipping build."
+  cp /app/ffmpeg-wrapper $PREFIX/bin/ffmpeg
   exec /app/entrypoint.sh "$@"
 fi
 
