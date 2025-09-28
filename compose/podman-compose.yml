@@ -89,6 +89,8 @@ services:
       - ../nextcloud/html:/var/www/html:rw
       - ../nextcloud/apps:/var/www/html/custom_apps:rw
       - ../nextcloud/themes:/var/www/html/themes:rw
+      - ../cron/www-data:/tmp/www-data:ro
+      - ../cron/cron.sh:/cron.sh:ro
     x-podman.uidmaps:
       - "+33:@${HOST_UID}:1"
       - "0:1:1"
@@ -213,13 +215,17 @@ services:
     extra_hosts:
       - "${FQDN}:${LAN_IP}"
   imaginary:
-    image: ghcr.io/nextcloud-releases/aio-imaginary:latest
+    image: docker.io/h2non/imaginary:latest
     container_name: nextcloud-imaginary
     depends_on:
       - app
+    environment:
+      PORT: 9000
+      DEBUG: "*"
+    command: ["-enable-url-source", "-mount", "/var/www/html/data"]
     restart: always
-    cap_add:
-      - SYS_NICE
+    volumes:
+      - ../data:/var/www/html/data:ro
     networks:
       - nextcloud_network
     extra_hosts:
@@ -290,6 +296,7 @@ services:
     depends_on:
       - app
     init: true
+    restart: always
     environment:
       - NEXTCLOUD_HOST=https://${FQDN}
       - NEXTCLOUD_ALLOW_INSECURE=1
@@ -301,6 +308,25 @@ services:
       - ../go-vod/ffmpeg-wrapper:/app/ffmpeg-wrapper:ro
       - ../go-vod/bin:/usr/local/bin:rw
     entrypoint: ["/app/build-ffmpeg-nvidia.sh"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    extra_hosts:
+      - "${FQDN}:${LAN_IP}"
+  face-recognition:
+    build: ../face-recognition/
+    container_name: nextcloud-face-recognition
+    depends_on:
+      - app
+    environment:
+      API_KEY: "${FACE_RECOGNITION_API_KEY}"
+      GUNICORN_WORKERS: 5
+    networks:
+      - nextcloud_network
     deploy:
       resources:
         reservations:

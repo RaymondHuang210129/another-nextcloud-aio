@@ -33,6 +33,7 @@ podman-compose up -d
    - [Talk (HPB + TURN)](#talk-hpb--turn)
    - [Nextcloud Office (Collabora)](#nextcloud-office)
    - [Memories](#memories)
+   - [Face Recognition](#face-recognition)
 9. [Troubleshooting](#troubleshooting)
 10. [Security Notes](#security-notes)
 11. [FAQ](#faq)

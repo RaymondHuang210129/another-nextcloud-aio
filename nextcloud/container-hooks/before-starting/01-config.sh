@@ -20,7 +20,8 @@ fi
 /var/www/html/occ config:system:set overwriteprotocol --value="https"
 /var/www/html/occ config:system:set overwrite.cli.url --value="https://${FQDN}/"
 
-/var/www/html/occ config:system:set preview_imaginary_url --value="http://imaginary:9000/"
+/var/www/html/occ config:system:set preview_imaginary_url --value="http://nextcloud-imaginary:9000/"
+/var/www/html/occ config:system:set allow_local_remote_servers --value="true" --type=boolean
 
 /var/www/html/occ config:system:set enabledPreviewProviders 0 --value="OC\Preview\MP3"
 /var/www/html/occ config:system:set enabledPreviewProviders 1 --value="OC\Preview\TXT"

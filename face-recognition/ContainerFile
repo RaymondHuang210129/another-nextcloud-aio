@@ -1,0 +1,102 @@
+# =========================
+# Builder: compile CUDA dlib
+# =========================
+FROM docker.io/nvidia/cuda:13.0.1-cudnn-devel-ubuntu24.04 AS builder
+
+# Toolchain & deps (ninja helps CMake); pin gcc-12 for nvcc
+RUN apt-get update -yq && DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+      build-essential cmake ninja-build git \
+      python3-dev python3-venv python3-pip \
+      libopenblas-dev wget bzip2 \
+      gcc-12 g++-12 \
+  && rm -rf /var/lib/apt/lists/*
+
+# Ensure CUDA tools are on PATH and nvcc uses gcc-12
+ENV PATH="/usr/local/cuda/bin:${PATH}" \
+    CC=/usr/bin/gcc-12 \
+    CXX=/usr/bin/g++-12 \
+    CUDAHOSTCXX=/usr/bin/g++-12
+
+# Modern Python build toolchain
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+RUN python -m pip install --upgrade pip setuptools wheel packaging
+
+# ---- Build dlib from source with CUDA enabled (Blackwell sm_120) ----
+# ARG DLIB_VERSION=20.0
+ARG DLIB_COMPUTE_CAPS="8.9" 
+ARG CMAKE_CUDA_ARCHS="89"
+
+# Some dlib builds need explicit cuDNN hints (cudnn v9 on CUDA 13)
+# Adjust the CUDNN_LIBRARY filename if your tag changes.
+ENV DLIB_USE_CUDA=1 \
+    DLIB_NO_GUI_SUPPORT=1 \
+    DLIB_EXTRA_CMAKE_FLAGS="-DDLIB_USE_CUDA=ON \
+                            -DDLIB_NO_GUI_SUPPORT=ON \
+                            -DDLIB_CUDA_COMPUTE_CAPABILITIES=${DLIB_COMPUTE_CAPS} \
+                            -DCMAKE_CUDA_ARCHITECTURES=89 \
+                            -DUSE_AVX_INSTRUCTIONS=ON \
+                            -arch=sm_89 \
+                            -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda \
+                            -DCUDNN_INCLUDE_DIR=/usr/include \
+                            -DCUDNN_LIBRARY=/usr/lib/x86_64-linux-gnu/libcudnn.so"
+
+# Clone and build wheel via legacy setup.py (honors the env flags above)
+RUN git clone --depth=1 --branch master https://github.com/davisking/dlib.git /tmp/dlib
+WORKDIR /tmp/dlib
+RUN python setup.py bdist_wheel
+
+# Put wheel where the runtime stage can grab it
+RUN mkdir -p /app && cp dist/dlib-*.whl /app/
+
+# Download your model files
+COPY Makefile /app/
+RUN make -C /app/ download-models
+
+# Verify wheel is CUDA-enabled; fail fast if not.
+RUN pip install /app/dlib-*.whl \
+ && python -c "import dlib,sys; print('BUILDER DLIB_USE_CUDA:',getattr(dlib,'DLIB_USE_CUDA',None)); sys.exit(0 if bool(getattr(dlib,'DLIB_USE_CUDA',False)) else 2)"
+
+# Add libopenblas.so.0's path into LD_LIBRARY_PATH for runtime
+ENV LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+
+# =========================
+# Runtime: minimal image
+# =========================
+FROM docker.io/nvidia/cuda:13.0.1-cudnn-devel-ubuntu24.04
+
+# Copy CUDA-enabled dlib wheel + models
+COPY --from=builder /app/dlib-*.whl /tmp/
+COPY --from=builder /app/vendor/ /app/vendor/
+
+# Python runtime deps
+RUN apt-get update -yq && DEBIAN_FRONTEND=noninteractive apt-get install -yq --no-install-recommends \
+      python3-pip \
+  && rm -rf /var/lib/apt/lists/*
+
+# Allow pip to install into system site on Ubuntu 24.04
+RUN python3 -m pip config set global.break-system-packages true
+
+# App deps + CUDA-enabled dlib
+RUN pip install --no-cache-dir flask numpy gunicorn \
+ && pip install --no-index -f /tmp/ dlib \
+ && rm /tmp/dlib-*.whl
+
+RUN apt-get update && apt-get install -y libopenblas-dev
+
+# App
+COPY facerecognition-external-model.py /app/
+COPY gunicorn_config.py /app/
+
+WORKDIR /app/
+
+EXPOSE 5000
+
+ARG GUNICORN_WORKERS="1" \
+    PORT="5000"
+ENV GUNICORN_WORKERS="${GUNICORN_WORKERS}"\
+    PORT="${PORT}"\
+    API_KEY=some-super-secret-api-key\
+    FLASK_APP=facerecognition-external-model.py
+
+ENTRYPOINT ["gunicorn"  , "-c", "gunicorn_config.py", "facerecognition-external-model:app"]
