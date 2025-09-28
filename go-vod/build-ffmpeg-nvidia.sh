@@ -50,8 +50,14 @@ make -C /tmp/nv-codec-headers install
 
 echo "[*] Fetching FFmpeg ${FFMPEG_TAG}"
 rm -rf /tmp/ffmpeg
-git clone --depth=1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg /tmp/ffmpeg
+git clone https://github.com/FFmpeg/FFmpeg /tmp/ffmpeg
 cd /tmp/ffmpeg
+
+# Add a patch made by Faeez Kadiri to enable transpose_cuda
+echo "[*] Applying transpose_cuda patch"
+git checkout "$FFMPEG_TAG"
+curl https://patchwork.ffmpeg.org/project/ffmpeg/patch/20250605110938.686643-1-f1k2faeez@gmail.com/raw/ > /tmp/patch
+git apply --3way /tmp/patch
 
 # trap 'cat /tmp/ffmpeg/ffbuild/config.log' ERR
 

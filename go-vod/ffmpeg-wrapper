@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Wrapper to normalize go-vod ffmpeg invocations for zero-copy CUDA/NVENC/NVDEC + robust HLS.
+# Wrapper to normalize go-vod ffmpeg invocations for zero-copy CUDA/NVENC/NVDEC + robust HLS,
+# and to auto-apply GPU rotation (transpose_cuda) based on camera/display-matrix metadata.
 
 set -euo pipefail
 
@@ -33,6 +34,24 @@ fix_vf() {
   fi
   printf '%s' "$vf"
 }
+# splice a filter BEFORE the first scale_cuda in an existing -vf string
+inject_before_scale_cuda() {
+  local vf="$1" add="$2"
+  if [[ "$vf" == *"scale_cuda="* ]]; then
+    echo "${vf/scale_cuda=/"$add",scale_cuda=}"
+  else
+    echo "$add,${vf}"
+  fi
+}
+# find the first input path (token following the first -i)
+get_input_path() {
+  local seen=false
+  for ((k=0;k<${#args[@]};k++)); do
+    if $seen; then echo "${args[k]}"; return 0; fi
+    [[ "${args[k]}" == "-i" ]] && seen=true
+  done
+  return 1
+}
 # -------------------------
 
 # 0) Make HLS segment dir if present
@@ -42,26 +61,67 @@ for ((i=0;i<${#args[@]}-1;i++)); do
   fi
 done
 
-# 1) Add -noautorotate to avoid double rotation
-# have_noauto=false
-# for a in "${args[@]}"; do [[ "$a" == "-noautorotate" ]] && have_noauto=true; done
-# $have_noauto || args=( -noautorotate "${args[@]}" )
-
-# 2) Ensure zero-copy decode: prepend input options
+# 1) Ensure zero-copy decode: prepend input options
 has_outfmt=false
 for ((i=0;i<${#args[@]}-1;i++)); do
   [[ "${args[i]}" == "-hwaccel_output_format" && "${args[i+1]}" == "cuda" ]] && { has_outfmt=true; break; }
 done
 $has_outfmt || args=( -hwaccel cuda -hwaccel_output_format cuda "${args[@]}" )
 
-# 3) Clean the filter graph(s)
+# 2) Clean the filter graph(s) first (so we inject into a normalized vf)
 for ((i=0;i<${#args[@]};i++)); do
   if [[ "${args[i]}" == "-vf" || "${args[i]}" == "-filter:v" ]]; then
     (( i+1 < ${#args[@]} )) && args[i+1]="$(fix_vf "${args[i+1]}")"
   fi
 done
 
-# 4) Remove timestamp troublemakers for HLS
+# 2.5) Detect rotation and inject transpose_cuda BEFORE scale_cuda (GPU rotate)
+INPUT_PATH="$(get_input_path || true)"
+ROT_RAW=""
+if [[ -n "$INPUT_PATH" && -r "$INPUT_PATH" ]]; then
+  # Your requested probe: side_data=rotation, take the first line
+  ROT_RAW="$(ffprobe -loglevel error -select_streams v:0 \
+             -show_entries stream_side_data=rotation \
+             -of default=nw=1:nk=1 -- "$INPUT_PATH" 2>/dev/null | head -n1 || true)"
+  # Fallback to stream tag 'rotate' if side-data missing
+  if [[ -z "$ROT_RAW" ]]; then
+    ROT_RAW="$(ffprobe -loglevel error -select_streams v:0 \
+               -show_entries stream_tags=rotate \
+               -of default=nw=1:nk=1 -- "$INPUT_PATH" 2>/dev/null | head -n1 || true)"
+  fi
+fi
+
+# Normalize to 0/90/180/270
+NORM=""
+ROT="${ROT_RAW//[!0-9\-]/}"   # keep only optional '-' and digits
+case "$ROT" in
+  90|-270)   NORM="-90" ;;
+  -90|270)   NORM="90" ;;
+  180|-180)  NORM="180" ;;
+  0|""|+0|-0) NORM="0" ;;
+  *)         NORM="0" ;;  # unknown → ignore
+esac
+
+echo "ROTATION: $NORM" >&2
+
+if [[ "$NORM" != "0" ]]; then
+  # build transpose_cuda sequence
+  case "$NORM" in
+    90)   ROTF="transpose_cuda=clock" ;;     # 90° clockwise
+    -90)  ROTF="transpose_cuda=cclock" ;;    # 90° counter-clockwise
+    180)  ROTF="transpose_cuda=clock,transpose_cuda=clock" ;;  # two steps
+  esac
+  # inject into each -vf/-filter:v BEFORE scale_cuda
+  for ((i=0;i<${#args[@]};i++)); do
+    if [[ "${args[i]}" == "-vf" || "${args[i]}" == "-filter:v" ]]; then
+      if (( i+1 < ${#args[@]} )); then
+        args[i+1]="$(inject_before_scale_cuda "${args[i+1]}" "$ROTF")"
+      fi
+    fi
+  done
+fi
+
+# 3) Remove timestamp troublemakers for HLS
 filtered=(); skip=false
 for ((i=0;i<${#args[@]};i++)); do
   if $skip; then skip=false; continue; fi
@@ -69,18 +129,22 @@ for ((i=0;i<${#args[@]};i++)); do
   if [[ "${args[i]}" == "-fflags" && "${args[i+1]:-}" == "+genpts" ]]; then
     skip=true; continue
   fi
+  # strip any earlier -avoid_negative_ts (we'll add our preferred one later)
+  if [[ "${args[i]}" == "-avoid_negative_ts" ]]; then
+    skip=true; continue
+  fi
   filtered+=( "${args[i]}" )
 done
 args=( "${filtered[@]}" )
 
-# 5) Force CFR 30 fps (output option)
+# 4) Force CFR 30 fps (output option)
 has_rv=false
 for ((i=0;i<${#args[@]};i++)); do
   [[ "${args[i]}" == "-r" || "${args[i]}" == "-r:v" ]] && { has_rv=true; break; }
 done
 $has_rv || insert_before_output args -r:v 30
 
-# 6) HLS: prefer independent segments; drop split_by_time; add force_key_frames
+# 5) HLS: prefer independent segments; drop split_by_time; add force_key_frames
 # read -hls_time (default 3)
 hls_time=3
 for ((i=0;i<${#args[@]}-1;i++)); do
@@ -94,14 +158,13 @@ have_hls_flags=false
 for ((i=0;i<${#args[@]}-1;i++)); do
   if [[ "${args[i]}" == "-hls_flags" ]]; then
     have_hls_flags=true
-    # remove split_by_time; normalize separators
     args[i+1]="$(echo "${args[i+1]}" | sed -E 's/\+?split_by_time//g; s/\+\+/\+/g; s/^\+//; s/\+$//')"
     [[ "${args[i+1]}" == *"independent_segments"* ]] || args[i+1]="${args[i+1]}${args[i+1]:+ +}independent_segments"
   fi
 done
 $have_hls_flags || insert_before_output args -hls_flags independent_segments
 
-# GOP alignment
+# GOP alignment (N = 30 * hls_time)
 g=$(( 30 * hls_time ))
 need_g=true; need_k=true; need_sc=true
 for ((i=0;i<${#args[@]};i++)); do
@@ -109,7 +172,7 @@ for ((i=0;i<${#args[@]};i++)); do
   [[ "${args[i]}" == "-keyint_min" ]] && need_k=false
   [[ "${args[i]}" == "-sc_threshold" ]] && need_sc=false
 endone=false
-done  # (the 'endone' line is just a guard to avoid accidental 'done' removal by editors)
+done
 $need_g && insert_before_output args -g "$g"
 $need_k && insert_before_output args -keyint_min "$g"
 $need_sc && insert_before_output args -sc_threshold 0
@@ -121,7 +184,7 @@ for ((i=0;i<${#args[@]};i++)); do
 done
 $have_fkf || insert_before_output args -force_key_frames "expr:gte(t,n_forced*${hls_time})"
 
-# 7) Low-latency: if tune=ll, set rc-lookahead=0
+# 6) Low-latency: if tune=ll, set rc-lookahead=0
 has_tune_ll=false; rc_idx=-1
 for ((i=0;i<${#args[@]}-1;i++)); do
   [[ "${args[i]}" == "-tune" && "${args[i+1]}" == "ll" ]] && has_tune_ll=true
@@ -133,16 +196,12 @@ if $has_tune_ll; then
   fi
 fi
 
-# 8) Timestamp hygiene for TS
+# 7) Timestamp hygiene for TS
 insert_before_output args -muxpreload 0 -muxdelay 0 -avoid_negative_ts make_zero
 
-# 9) Optional: switch to fMP4 segments if env asks (often more MSE-friendly)
+# 8) Optional: switch to fMP4 segments if env asks
 if [[ "${HLS_FMP4:-0}" == "1" ]]; then
-  # replace/append HLS options for fMP4
   insert_before_output args -hls_segment_type fmp4
-  # optional init segment name if your player expects it:
-  # insert_before_output args -hls_fmp4_init_filename init.mp4
-  # and for MP4 fragging:
   insert_before_output args -movflags +frag_keyframe+empty_moov
 fi
 
