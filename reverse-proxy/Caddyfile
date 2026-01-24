@@ -68,7 +68,7 @@
         # --- 4. Handle all other traffic as the default ---
         # This is the fallback for the main Nextcloud application
         handle {
-            reverse_proxy app:80 {
+            reverse_proxy nextcloud:80 {
                 header_up Host {host}
                 header_up X-Forwarded-Proto {scheme}
                 header_up X-Forwarded-For {remote_host}

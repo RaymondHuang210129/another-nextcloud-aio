@@ -298,7 +298,7 @@ services:
     init: true
     restart: always
     environment:
-      - NEXTCLOUD_HOST=https://${FQDN}
+      - NEXTCLOUD_HOST=http://nextcloud
       - NEXTCLOUD_ALLOW_INSECURE=1
       - NVIDIA_VISIBLE_DEVICES=all
     volumes:
@@ -322,6 +322,7 @@ services:
     container_name: nextcloud-face-recognition
     depends_on:
       - app
+    restart: always
     environment:
       API_KEY: "${FACE_RECOGNITION_API_KEY}"
       GUNICORN_WORKERS: 5

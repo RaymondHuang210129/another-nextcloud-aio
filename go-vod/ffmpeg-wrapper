@@ -89,6 +89,12 @@ if [[ -n "$INPUT_PATH" && -r "$INPUT_PATH" ]]; then
                -show_entries stream_tags=rotate \
                -of default=nw=1:nk=1 -- "$INPUT_PATH" 2>/dev/null | head -n1 || true)"
   fi
+  # check if metadata contains com.apple.quicktime.live-photo.auto
+  is_live_photo=false
+  if ffprobe -loglevel error -show_entries format_tags=com.apple.quicktime.live-photo.auto \
+       -of default=nw=1:nk=1 -- "$INPUT_PATH" 2>/dev/null | grep -q '^1$'; then
+    is_live_photo=true
+  fi
 fi
 
 # Normalize to 0/90/180/270
@@ -103,6 +109,11 @@ case "$ROT" in
 esac
 
 echo "ROTATION: $NORM" >&2
+
+if $is_live_photo; then
+  echo "NOTE: live-photo detected; skipping rotation correction" >&2
+  NORM="0"
+fi
 
 if [[ "$NORM" != "0" ]]; then
   # build transpose_cuda sequence
