@@ -183,6 +183,15 @@ fi
 # The remaining timestamp/GOP/muxer changes are HLS-specific.
 if $is_hls; then
 
+# Detect the active segment type before normalizing timestamp options. Custom
+# go-vod rewrites completed fMP4 fragment timelines before publishing them;
+# MPEG-TS uses the older make-zero muxer policy.
+hls_segment_type="mpegts"
+for ((i=0;i<${#args[@]}-1;i++)); do
+  [[ "${args[i]}" == "-hls_segment_type" ]] && hls_segment_type="${args[i+1]}"
+done
+[[ "${HLS_FMP4:-0}" == "1" ]] && hls_segment_type="fmp4"
+
 # 3) Remove timestamp troublemakers for HLS
 filtered=(); skip=false
 for ((i=0;i<${#args[@]};i++)); do
@@ -195,6 +204,12 @@ for ((i=0;i<${#args[@]};i++)); do
   if [[ "${args[i]}" == "-avoid_negative_ts" ]]; then
     skip=true; continue
   fi
+  # An fMP4 output offset is written into the generation-specific init
+  # segment by FFmpeg, not into tfdt. The player caches the original init, so
+  # leave fragments local here and let go-vod normalize their MP4 boxes.
+  if [[ "$hls_segment_type" == "fmp4" && "${args[i]}" == "-output_ts_offset" ]]; then
+    skip=true; continue
+  fi
   filtered+=( "${args[i]}" )
 done
 args=( "${filtered[@]}" )
@@ -205,6 +220,10 @@ is_nvenc=false
 have_bitrate=false
 have_maxrate=false
 have_bufsize=false
+cq_idx=-1
+spatial_aq_idx=-1
+temporal_aq_idx=-1
+aq_strength_idx=-1
 for ((i=0;i<${#args[@]};i++)); do
   if [[ "${args[i]}" == "-c:v" ]] &&
      [[ "${args[i+1]:-}" == "h264_nvenc" || "${args[i+1]:-}" == "hevc_nvenc" ]]; then
@@ -213,11 +232,35 @@ for ((i=0;i<${#args[@]};i++)); do
   [[ "${args[i]}" == "-b:v" || "${args[i]}" == "-b:v:0" ]] && have_bitrate=true
   [[ "${args[i]}" == "-maxrate" || "${args[i]}" == "-maxrate:v" || "${args[i]}" == "-maxrate:v:0" ]] && have_maxrate=true
   [[ "${args[i]}" == "-bufsize" || "${args[i]}" == "-bufsize:v" || "${args[i]}" == "-bufsize:v:0" ]] && have_bufsize=true
+  [[ "${args[i]}" == "-cq" ]] && cq_idx=$((i+1))
+  [[ "${args[i]}" == "-spatial-aq" ]] && spatial_aq_idx=$((i+1))
+  [[ "${args[i]}" == "-temporal-aq" ]] && temporal_aq_idx=$((i+1))
+  [[ "${args[i]}" == "-aq-strength" ]] && aq_strength_idx=$((i+1))
 done
 if $is_nvenc; then
   $have_bitrate || insert_before_output args -b:v "${GO_VOD_MAX_BITRATE:-12M}"
   $have_maxrate || insert_before_output args -maxrate:v "${GO_VOD_MAX_MAXRATE:-16M}"
   $have_bufsize || insert_before_output args -bufsize:v "${GO_VOD_MAX_BUFSIZE:-32M}"
+
+  # Improve perceptual quality without enabling multipass or relaxing VBV.
+  # Existing go-vod options are replaced so each NVENC option occurs once.
+  nvenc_cq="${GO_VOD_NVENC_CQ:-22}"
+  nvenc_spatial_aq="${GO_VOD_NVENC_SPATIAL_AQ:-1}"
+  nvenc_temporal_aq="${GO_VOD_NVENC_TEMPORAL_AQ:-1}"
+  nvenc_aq_strength="${GO_VOD_NVENC_AQ_STRENGTH:-8}"
+
+  if (( cq_idx >= 0 )); then args[cq_idx]="$nvenc_cq"
+  else insert_before_output args -cq "$nvenc_cq"
+  fi
+  if (( spatial_aq_idx >= 0 )); then args[spatial_aq_idx]="$nvenc_spatial_aq"
+  else insert_before_output args -spatial-aq "$nvenc_spatial_aq"
+  fi
+  if (( temporal_aq_idx >= 0 )); then args[temporal_aq_idx]="$nvenc_temporal_aq"
+  else insert_before_output args -temporal-aq "$nvenc_temporal_aq"
+  fi
+  if (( aq_strength_idx >= 0 )); then args[aq_strength_idx]="$nvenc_aq_strength"
+  else insert_before_output args -aq-strength "$nvenc_aq_strength"
+  fi
 
   # HLS fMP4 renditions must be independently decodable after an adaptive
   # quality switch. NVENC otherwise may encode forced keyframes as non-IDR.
@@ -289,8 +332,12 @@ if $has_tune_ll; then
   fi
 fi
 
-# 7) Timestamp hygiene for TS
-insert_before_output args -muxpreload 0 -muxdelay 0 -avoid_negative_ts make_zero
+# 7) Segment-type-specific timestamp policy.
+if [[ "$hls_segment_type" == "fmp4" ]]; then
+  insert_before_output args -avoid_negative_ts disabled
+else
+  insert_before_output args -muxpreload 0 -muxdelay 0 -avoid_negative_ts make_zero
+fi
 
 # 8) Optional: switch to fMP4 segments if env asks
 if [[ "${HLS_FMP4:-0}" == "1" ]]; then

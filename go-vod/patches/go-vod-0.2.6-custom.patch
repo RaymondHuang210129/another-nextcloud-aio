@@ -33,6 +33,419 @@ index 27daac5..084c887 100644
  	// Auto-detect ffmpeg and ffprobe paths
  	if c.FFmpeg == "" || c.FFprobe == "" {
  		ffmpeg, err := exec.LookPath("ffmpeg")
+diff --git a/go-vod/transcoder/fmp4.go b/go-vod/transcoder/fmp4.go
+new file mode 100644
+index 0000000..87720a5
+--- /dev/null
++++ b/go-vod/transcoder/fmp4.go
+@@ -0,0 +1,246 @@
++package transcoder
++
++import (
++	"encoding/binary"
++	"fmt"
++	"math"
++	"os"
++	"path/filepath"
++)
++
++type mp4Box struct {
++	typ          string
++	start        int
++	end          int
++	payloadStart int
++}
++
++func parseMP4Boxes(data []byte, start int, end int) ([]mp4Box, error) {
++	if start < 0 || end < start || end > len(data) {
++		return nil, fmt.Errorf("invalid MP4 box range %d:%d", start, end)
++	}
++
++	boxes := make([]mp4Box, 0)
++	for pos := start; pos < end; {
++		if end-pos < 8 {
++			return nil, fmt.Errorf("truncated MP4 box header at %d", pos)
++		}
++
++		size := uint64(binary.BigEndian.Uint32(data[pos : pos+4]))
++		headerSize := 8
++		if size == 1 {
++			if end-pos < 16 {
++				return nil, fmt.Errorf("truncated extended MP4 box header at %d", pos)
++			}
++			size = binary.BigEndian.Uint64(data[pos+8 : pos+16])
++			headerSize = 16
++		} else if size == 0 {
++			size = uint64(end - pos)
++		}
++
++		if size < uint64(headerSize) || size > uint64(end-pos) {
++			return nil, fmt.Errorf("invalid MP4 box size %d at %d", size, pos)
++		}
++		boxEnd := pos + int(size)
++		boxes = append(boxes, mp4Box{
++			typ:          string(data[pos+4 : pos+8]),
++			start:        pos,
++			end:          boxEnd,
++			payloadStart: pos + headerSize,
++		})
++		pos = boxEnd
++	}
++	return boxes, nil
++}
++
++func findMP4Box(boxes []mp4Box, typ string) (mp4Box, bool) {
++	for _, box := range boxes {
++		if box.typ == typ {
++			return box, true
++		}
++	}
++	return mp4Box{}, false
++}
++
++func parseMP4TrackTimescales(filename string) (map[uint32]uint32, error) {
++	data, err := os.ReadFile(filename)
++	if err != nil {
++		return nil, err
++	}
++	root, err := parseMP4Boxes(data, 0, len(data))
++	if err != nil {
++		return nil, err
++	}
++	moov, ok := findMP4Box(root, "moov")
++	if !ok {
++		return nil, fmt.Errorf("MP4 init has no moov box")
++	}
++	moovChildren, err := parseMP4Boxes(data, moov.payloadStart, moov.end)
++	if err != nil {
++		return nil, err
++	}
++
++	timescales := make(map[uint32]uint32)
++	for _, trak := range moovChildren {
++		if trak.typ != "trak" {
++			continue
++		}
++		trakChildren, err := parseMP4Boxes(data, trak.payloadStart, trak.end)
++		if err != nil {
++			return nil, err
++		}
++		tkhd, haveTkhd := findMP4Box(trakChildren, "tkhd")
++		mdia, haveMdia := findMP4Box(trakChildren, "mdia")
++		if !haveTkhd || !haveMdia || tkhd.end-tkhd.payloadStart < 20 {
++			return nil, fmt.Errorf("MP4 track is missing tkhd or mdia metadata")
++		}
++
++		tkhdVersion := data[tkhd.payloadStart]
++		trackIDOffset := tkhd.payloadStart + 12
++		if tkhdVersion == 1 {
++			trackIDOffset = tkhd.payloadStart + 20
++		} else if tkhdVersion != 0 {
++			return nil, fmt.Errorf("unsupported tkhd version %d", tkhdVersion)
++		}
++		if trackIDOffset+4 > tkhd.end {
++			return nil, fmt.Errorf("truncated tkhd box")
++		}
++		trackID := binary.BigEndian.Uint32(data[trackIDOffset : trackIDOffset+4])
++
++		mdiaChildren, err := parseMP4Boxes(data, mdia.payloadStart, mdia.end)
++		if err != nil {
++			return nil, err
++		}
++		mdhd, ok := findMP4Box(mdiaChildren, "mdhd")
++		if !ok || mdhd.end-mdhd.payloadStart < 20 {
++			return nil, fmt.Errorf("MP4 track %d has no valid mdhd box", trackID)
++		}
++		mdhdVersion := data[mdhd.payloadStart]
++		timescaleOffset := mdhd.payloadStart + 12
++		if mdhdVersion == 1 {
++			timescaleOffset = mdhd.payloadStart + 20
++		} else if mdhdVersion != 0 {
++			return nil, fmt.Errorf("unsupported mdhd version %d", mdhdVersion)
++		}
++		if timescaleOffset+4 > mdhd.end {
++			return nil, fmt.Errorf("truncated mdhd box")
++		}
++		timescale := binary.BigEndian.Uint32(data[timescaleOffset : timescaleOffset+4])
++		if trackID == 0 || timescale == 0 {
++			return nil, fmt.Errorf("invalid MP4 track metadata: id=%d timescale=%d", trackID, timescale)
++		}
++		timescales[trackID] = timescale
++	}
++	if len(timescales) == 0 {
++		return nil, fmt.Errorf("MP4 init contains no track timescales")
++	}
++	return timescales, nil
++}
++
++func normalizeFMP4Fragment(filename string, segmentID int, startAt float64, timescales map[uint32]uint32) error {
++	data, err := os.ReadFile(filename)
++	if err != nil {
++		return err
++	}
++	root, err := parseMP4Boxes(data, 0, len(data))
++	if err != nil {
++		return err
++	}
++	moof, ok := findMP4Box(root, "moof")
++	if !ok {
++		return fmt.Errorf("MP4 fragment has no moof box")
++	}
++	moofChildren, err := parseMP4Boxes(data, moof.payloadStart, moof.end)
++	if err != nil {
++		return err
++	}
++
++	mfhd, ok := findMP4Box(moofChildren, "mfhd")
++	if !ok || mfhd.payloadStart+8 > mfhd.end {
++		return fmt.Errorf("MP4 fragment has no valid mfhd box")
++	}
++	maxUint32 := uint64(^uint32(0))
++	if segmentID < 0 || uint64(segmentID)+1 > maxUint32 {
++		return fmt.Errorf("invalid MP4 segment id %d", segmentID)
++	}
++	binary.BigEndian.PutUint32(data[mfhd.payloadStart+4:mfhd.payloadStart+8], uint32(segmentID+1))
++
++	trafCount := 0
++	for _, traf := range moofChildren {
++		if traf.typ != "traf" {
++			continue
++		}
++		trafChildren, err := parseMP4Boxes(data, traf.payloadStart, traf.end)
++		if err != nil {
++			return err
++		}
++		tfhd, haveTfhd := findMP4Box(trafChildren, "tfhd")
++		tfdt, haveTfdt := findMP4Box(trafChildren, "tfdt")
++		if !haveTfhd || !haveTfdt || tfhd.payloadStart+8 > tfhd.end || tfdt.payloadStart+8 > tfdt.end {
++			return fmt.Errorf("MP4 traf is missing valid tfhd or tfdt metadata")
++		}
++		trackID := binary.BigEndian.Uint32(data[tfhd.payloadStart+4 : tfhd.payloadStart+8])
++		timescale, ok := timescales[trackID]
++		if !ok {
++			return fmt.Errorf("MP4 fragment references unknown track %d", trackID)
++		}
++		offset := uint64(math.Round(startAt * float64(timescale)))
++		version := data[tfdt.payloadStart]
++		if version == 1 {
++			if tfdt.payloadStart+12 > tfdt.end {
++				return fmt.Errorf("truncated version 1 tfdt box")
++			}
++			base := binary.BigEndian.Uint64(data[tfdt.payloadStart+4 : tfdt.payloadStart+12])
++			if ^uint64(0)-base < offset {
++				return fmt.Errorf("version 1 tfdt overflow")
++			}
++			binary.BigEndian.PutUint64(data[tfdt.payloadStart+4:tfdt.payloadStart+12], base+offset)
++		} else if version == 0 {
++			base := uint64(binary.BigEndian.Uint32(data[tfdt.payloadStart+4 : tfdt.payloadStart+8]))
++			if base+offset > maxUint32 {
++				return fmt.Errorf("version 0 tfdt overflow")
++			}
++			binary.BigEndian.PutUint32(data[tfdt.payloadStart+4:tfdt.payloadStart+8], uint32(base+offset))
++		} else {
++			return fmt.Errorf("unsupported tfdt version %d", version)
++		}
++		trafCount++
++	}
++	if trafCount == 0 {
++		return fmt.Errorf("MP4 fragment contains no traf boxes")
++	}
++
++	info, err := os.Stat(filename)
++	if err != nil {
++		return err
++	}
++	temp, err := os.CreateTemp(filepath.Dir(filename), filepath.Base(filename)+".timeline-*")
++	if err != nil {
++		return err
++	}
++	tempName := temp.Name()
++	committed := false
++	defer func() {
++		temp.Close()
++		if !committed {
++			os.Remove(tempName)
++		}
++	}()
++	if err := temp.Chmod(info.Mode().Perm()); err != nil {
++		return err
++	}
++	if _, err := temp.Write(data); err != nil {
++		return err
++	}
++	if err := temp.Sync(); err != nil {
++		return err
++	}
++	if err := temp.Close(); err != nil {
++		return err
++	}
++	if err := os.Rename(tempName, filename); err != nil {
++		return err
++	}
++	committed = true
++	return nil
++}
+diff --git a/go-vod/transcoder/fmp4_test.go b/go-vod/transcoder/fmp4_test.go
+new file mode 100644
+index 0000000..0436b8b
+--- /dev/null
++++ b/go-vod/transcoder/fmp4_test.go
+@@ -0,0 +1,155 @@
++package transcoder
++
++import (
++	"encoding/binary"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func testMP4Box(typ string, payload ...[]byte) []byte {
++	size := 8
++	for _, part := range payload {
++		size += len(part)
++	}
++	box := make([]byte, size)
++	binary.BigEndian.PutUint32(box[0:4], uint32(size))
++	copy(box[4:8], typ)
++	pos := 8
++	for _, part := range payload {
++		copy(box[pos:], part)
++		pos += len(part)
++	}
++	return box
++}
++
++func testMP4InitTrack(trackID uint32, timescale uint32) []byte {
++	tkhd := make([]byte, 20)
++	binary.BigEndian.PutUint32(tkhd[12:16], trackID)
++	mdhd := make([]byte, 20)
++	binary.BigEndian.PutUint32(mdhd[12:16], timescale)
++	return testMP4Box("trak", testMP4Box("tkhd", tkhd), testMP4Box("mdia", testMP4Box("mdhd", mdhd)))
++}
++
++func testMP4Traf(trackID uint32, baseDecodeTime uint64) []byte {
++	tfhd := make([]byte, 8)
++	binary.BigEndian.PutUint32(tfhd[4:8], trackID)
++	tfdt := make([]byte, 12)
++	tfdt[0] = 1
++	binary.BigEndian.PutUint64(tfdt[4:12], baseDecodeTime)
++	return testMP4Box("traf", testMP4Box("tfhd", tfhd), testMP4Box("tfdt", tfdt))
++}
++
++func readTestFragmentFields(t *testing.T, filename string) (uint32, map[uint32]uint64) {
++	t.Helper()
++	data, err := os.ReadFile(filename)
++	if err != nil {
++		t.Fatal(err)
++	}
++	root, err := parseMP4Boxes(data, 0, len(data))
++	if err != nil {
++		t.Fatal(err)
++	}
++	moof, ok := findMP4Box(root, "moof")
++	if !ok {
++		t.Fatal("no moof box")
++	}
++	children, err := parseMP4Boxes(data, moof.payloadStart, moof.end)
++	if err != nil {
++		t.Fatal(err)
++	}
++	mfhd, ok := findMP4Box(children, "mfhd")
++	if !ok {
++		t.Fatal("no mfhd box")
++	}
++	sequence := binary.BigEndian.Uint32(data[mfhd.payloadStart+4 : mfhd.payloadStart+8])
++	decodeTimes := make(map[uint32]uint64)
++	for _, traf := range children {
++		if traf.typ != "traf" {
++			continue
++		}
++		trafChildren, err := parseMP4Boxes(data, traf.payloadStart, traf.end)
++		if err != nil {
++			t.Fatal(err)
++		}
++		tfhd, _ := findMP4Box(trafChildren, "tfhd")
++		tfdt, _ := findMP4Box(trafChildren, "tfdt")
++		trackID := binary.BigEndian.Uint32(data[tfhd.payloadStart+4 : tfhd.payloadStart+8])
++		decodeTimes[trackID] = binary.BigEndian.Uint64(data[tfdt.payloadStart+4 : tfdt.payloadStart+12])
++	}
++	return sequence, decodeTimes
++}
++
++func TestNormalizeFMP4FragmentUsesAbsolutePlaylistTimeline(t *testing.T) {
++	tempDir := t.TempDir()
++	initPath := filepath.Join(tempDir, "init.mp4")
++	initData := testMP4Box("ftyp", []byte("test"))
++	initData = append(initData, testMP4Box("moov",
++		testMP4InitTrack(1, 1000),
++		testMP4InitTrack(2, 48000),
++	)...)
++	if err := os.WriteFile(initPath, initData, 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	mfhd := make([]byte, 8)
++	binary.BigEndian.PutUint32(mfhd[4:8], 1)
++	fragmentData := testMP4Box("styp", []byte("test"))
++	fragmentData = append(fragmentData, testMP4Box("moof",
++		testMP4Box("mfhd", mfhd),
++		testMP4Traf(1, 25),
++		testMP4Traf(2, 1024),
++	)...)
++	// Box-like bytes in media payload must never be rewritten.
++	fragmentData = append(fragmentData, testMP4Box("mdat", []byte("mfhd....tfdt"))...)
++	fragmentPath := filepath.Join(tempDir, "720p-000058.m4s")
++	if err := os.WriteFile(fragmentPath, fragmentData, 0640); err != nil {
++		t.Fatal(err)
++	}
++
++	timescales, err := parseMP4TrackTimescales(initPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if timescales[1] != 1000 || timescales[2] != 48000 {
++		t.Fatalf("unexpected track timescales: %#v", timescales)
++	}
++	if err := normalizeFMP4Fragment(fragmentPath, 58, 174, timescales); err != nil {
++		t.Fatal(err)
++	}
++
++	sequence, decodeTimes := readTestFragmentFields(t, fragmentPath)
++	if sequence != 59 {
++		t.Fatalf("mfhd sequence = %d, want 59", sequence)
++	}
++	if decodeTimes[1] != 174025 {
++		t.Fatalf("video tfdt = %d, want 174025", decodeTimes[1])
++	}
++	if decodeTimes[2] != 8353024 {
++		t.Fatalf("audio tfdt = %d, want 8353024", decodeTimes[2])
++	}
++	info, err := os.Stat(fragmentPath)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != 0640 {
++		t.Fatalf("fragment mode = %o, want 640", info.Mode().Perm())
++	}
++	if leftovers, err := filepath.Glob(fragmentPath + ".timeline-*"); err != nil {
++		t.Fatal(err)
++	} else if len(leftovers) != 0 {
++		t.Fatalf("timeline temp files were left behind: %v", leftovers)
++	}
++}
++
++func TestNormalizeFMP4FragmentRejectsUnknownTrack(t *testing.T) {
++	fragmentPath := filepath.Join(t.TempDir(), "bad.m4s")
++	mfhd := make([]byte, 8)
++	fragmentData := testMP4Box("moof", testMP4Box("mfhd", mfhd), testMP4Traf(7, 0))
++	if err := os.WriteFile(fragmentPath, fragmentData, 0600); err != nil {
++		t.Fatal(err)
++	}
++	if err := normalizeFMP4Fragment(fragmentPath, 1, 3, map[uint32]uint32{1: 1000}); err == nil {
++		t.Fatal("unknown fragment track was accepted")
++	}
++}
 diff --git a/go-vod/transcoder/manager.go b/go-vod/transcoder/manager.go
 index 7e0e2a6..af3cb9e 100644
 --- a/go-vod/transcoder/manager.go
@@ -228,7 +641,7 @@ index 7e0e2a6..af3cb9e 100644
  
  	return nil
 diff --git a/go-vod/transcoder/stream.go b/go-vod/transcoder/stream.go
-index a8b699b..bab3bb1 100644
+index a8b699b..d41ce22 100644
 --- a/go-vod/transcoder/stream.go
 +++ b/go-vod/transcoder/stream.go
 @@ -8,6 +8,7 @@ import (
@@ -259,7 +672,15 @@ index a8b699b..bab3bb1 100644
  )
  
  type Stream struct {
-@@ -114,26 +117,50 @@ func (s *Stream) Stop() {
+@@ -102,6 +105,7 @@ func (s *Stream) clear() {
+ 		s.coder.Wait()
+ 		s.coder = nil
+ 	}
++	os.Remove(s.getTransientInitPath())
+ }
+ 
+ func (s *Stream) Stop() {
+@@ -114,26 +118,50 @@ func (s *Stream) Stop() {
  func (s *Stream) ServeList(w http.ResponseWriter, r *http.Request) error {
  	WriteM3U8ContentType(w)
  	w.Write([]byte("#EXTM3U\n"))
@@ -324,7 +745,7 @@ index a8b699b..bab3bb1 100644
  	}
  
  	w.Write([]byte("#EXT-X-ENDLIST\n"))
-@@ -141,6 +168,39 @@ func (s *Stream) ServeList(w http.ResponseWriter, r *http.Request) error {
+@@ -141,6 +169,39 @@ func (s *Stream) ServeList(w http.ResponseWriter, r *http.Request) error {
  	return nil
  }
  
@@ -364,7 +785,7 @@ index a8b699b..bab3bb1 100644
  func (s *Stream) ServeChunk(w http.ResponseWriter, id int) error {
  	s.mutex.Lock()
  	defer s.mutex.Unlock()
-@@ -155,20 +215,13 @@ func (s *Stream) ServeChunk(w http.ResponseWriter, id int) error {
+@@ -155,20 +216,13 @@ func (s *Stream) ServeChunk(w http.ResponseWriter, id int) error {
  			s.returnChunk(w, chunk)
  			return nil
  		}
@@ -390,7 +811,7 @@ index a8b699b..bab3bb1 100644
  		// Make sure the chunk exists
  		chunk := s.createChunk(id)
  
-@@ -182,6 +235,24 @@ func (s *Stream) ServeChunk(w http.ResponseWriter, id int) error {
+@@ -182,6 +236,24 @@ func (s *Stream) ServeChunk(w http.ResponseWriter, id int) error {
  	return nil
  }
  
@@ -415,7 +836,7 @@ index a8b699b..bab3bb1 100644
  func (s *Stream) ServeFullVideo(w http.ResponseWriter, r *http.Request) error {
  	args := s.transcodeArgs(0, false)
  
-@@ -271,7 +342,7 @@ func (s *Stream) pruneChunk(id int) {
+@@ -271,7 +343,7 @@ func (s *Stream) pruneChunk(id int) {
  	delete(s.chunks, id)
  
  	// Remove file
@@ -424,7 +845,7 @@ index a8b699b..bab3bb1 100644
  	os.Remove(filename)
  }
  
-@@ -281,7 +352,7 @@ func (s *Stream) returnChunk(w http.ResponseWriter, chunk *Chunk) {
+@@ -281,7 +353,7 @@ func (s *Stream) returnChunk(w http.ResponseWriter, chunk *Chunk) {
  	defer s.mutex.Lock()
  
  	// Read file and write to response
@@ -433,7 +854,7 @@ index a8b699b..bab3bb1 100644
  	f, err := os.Open(filename)
  	if err != nil {
  		log.Println(err)
-@@ -289,7 +360,11 @@ func (s *Stream) returnChunk(w http.ResponseWriter, chunk *Chunk) {
+@@ -289,7 +361,11 @@ func (s *Stream) returnChunk(w http.ResponseWriter, chunk *Chunk) {
  		return
  	}
  	defer f.Close()
@@ -446,7 +867,7 @@ index a8b699b..bab3bb1 100644
  	io.Copy(w, f)
  }
  
-@@ -374,6 +449,9 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
+@@ -374,6 +450,9 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
  		args = append(args, strings.Split(extra, " ")...)
  	} else if s.c.NVENC {
  		CV = ENCODER_NVENC
@@ -456,7 +877,7 @@ index a8b699b..bab3bb1 100644
  		extra := "-hwaccel cuda"
  		args = append(args, strings.Split(extra, " ")...)
  	}
-@@ -400,7 +478,7 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
+@@ -400,7 +479,7 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
  		format = "format=nv12|vaapi,hwupload"
  		scaler = "scale_vaapi"
  		scalerArgs = append(scalerArgs, "format=nv12")
@@ -465,7 +886,7 @@ index a8b699b..bab3bb1 100644
  		format = "format=nv12|cuda,hwupload"
  		scaler = fmt.Sprintf("scale_%s", s.c.NVENCScale)
  
-@@ -435,7 +513,7 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
+@@ -435,7 +514,7 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
  			transposer := "transpose"
  			if CV == ENCODER_VAAPI {
  				transposer = "transpose_vaapi"
@@ -474,7 +895,7 @@ index a8b699b..bab3bb1 100644
  				transposer = fmt.Sprintf("transpose_%s", s.c.NVENCScale)
  			}
  
-@@ -487,14 +565,24 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
+@@ -487,14 +566,24 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
  		if s.c.VAAPILowPower {
  			args = append(args, []string{"-low_power", "1"}...)
  		}
@@ -501,7 +922,7 @@ index a8b699b..bab3bb1 100644
  
  		if s.c.NVENCTemporalAQ {
  			args = append(args, []string{"-temporal-aq", "1"}...)
-@@ -526,6 +614,10 @@ func (s *Stream) transcode(startId int) {
+@@ -526,9 +615,13 @@ func (s *Stream) transcode(startId int) {
  	args := s.transcodeArgs(startAt, true)
  
  	// Segmenting specs
@@ -509,10 +930,15 @@ index a8b699b..bab3bb1 100644
 +	if s.usesFMP4() {
 +		segmentType = "fmp4"
 +	}
++	args = append(args, "-start_number", fmt.Sprintf("%d", startId))
++	args = append(args, s.hlsTimestampArgs(startAt)...)
  	args = append(args, []string{
- 		"-start_number", fmt.Sprintf("%d", startId),
- 		"-avoid_negative_ts", "disabled",
-@@ -547,9 +639,12 @@ func (s *Stream) transcode(startId int) {
+-		"-start_number", fmt.Sprintf("%d", startId),
+-		"-avoid_negative_ts", "disabled",
+ 		"-f", "hls",
+ 
+ 		// We force a keyframe at the start of each segment.
+@@ -547,9 +640,12 @@ func (s *Stream) transcode(startId int) {
  		"-hls_flags", "split_by_time",
  		"-hls_time", fmt.Sprintf("%d", s.c.ChunkSize),
  
@@ -522,12 +948,23 @@ index a8b699b..bab3bb1 100644
 +		"-hls_segment_filename", s.getSegmentPath(-1),
  	}...)
 +	if s.usesFMP4() {
-+		args = append(args, "-hls_fmp4_init_filename", s.getInitPath())
++		args = append(args, "-hls_fmp4_init_filename", s.getEncoderInitPath())
 +	}
  
  	// Keyframe specs
  	if s.c.UseGopSize && s.m.probe.FrameRate > 0 {
-@@ -616,11 +711,56 @@ func (s *Stream) checkGoal(id int) {
+@@ -603,6 +699,10 @@ func (s *Stream) transcode(startId int) {
+ 	go s.monitorExit()
+ }
+ 
++func (s *Stream) hlsTimestampArgs(startAt float64) []string {
++	return []string{"-avoid_negative_ts", "disabled"}
++}
++
+ func (s *Stream) checkGoal(id int) {
+ 	goal := id + s.c.GoalBufferMin
+ 	if goal > s.goal {
+@@ -616,11 +716,68 @@ func (s *Stream) checkGoal(id int) {
  	}
  }
  
@@ -547,13 +984,25 @@ index a8b699b..bab3bb1 100644
  	if id == -1 {
 -		return fmt.Sprintf("%s/%s-%%06d.ts", s.m.tempDir, s.quality)
 +		return fmt.Sprintf("%s/%s-%%06d%s", s.m.tempDir, s.quality, s.segmentExtension())
- 	}
--	return fmt.Sprintf("%s/%s-%06d.ts", s.m.tempDir, s.quality, id)
++	}
 +	return fmt.Sprintf("%s/%s-%06d%s", s.m.tempDir, s.quality, id, s.segmentExtension())
 +}
 +
 +func (s *Stream) getInitPath() string {
 +	return fmt.Sprintf("%s/%s-init.mp4", s.m.tempDir, s.quality)
++}
++
++func (s *Stream) getTransientInitPath() string {
++	return fmt.Sprintf("%s/%s-init-next.mp4", s.m.tempDir, s.quality)
++}
++
++func (s *Stream) getEncoderInitPath() string {
++	if _, err := os.Stat(s.getInitPath()); err == nil {
++		// Keep the initialization segment immutable once a client may cache it.
++		return s.getTransientInitPath()
+ 	}
+-	return fmt.Sprintf("%s/%s-%06d.ts", s.m.tempDir, s.quality, id)
++	return s.getInitPath()
 +}
 +
 +func (s *Stream) hevcLevel() string {
@@ -587,7 +1036,7 @@ index a8b699b..bab3bb1 100644
  }
  
  // Separate goroutine
-@@ -651,12 +791,15 @@ func (s *Stream) monitorTranscodeOutput(cmdStdOut io.ReadCloser, startAt float64
+@@ -651,17 +808,35 @@ func (s *Stream) monitorTranscodeOutput(cmdStdOut io.ReadCloser, startAt float64
  
  		l := string(line)
  
@@ -606,7 +1055,27 @@ index a8b699b..bab3bb1 100644
  			}
  
  			if s.seenChunks[id] {
-@@ -720,21 +863,28 @@ func (s *Stream) monitorExit() {
+ 				continue
+ 			}
++
++			// FFmpeg starts every fMP4 encoder generation at decode time zero.
++			// Move each completed fragment onto the static VOD playlist
++			// timeline before any waiting HTTP request can read it.
++			if s.usesFMP4() {
++				timescales, err := parseMP4TrackTimescales(s.getInitPath())
++				if err == nil {
++					err = normalizeFMP4Fragment(s.getSegmentPath(id), id, startAt, timescales)
++				}
++				if err != nil {
++					log.Printf("%s-%s: failed to normalize %s timeline: %s", s.m.id, s.quality, l, err)
++					coder.Process.Kill()
++					continue
++				}
++			}
+ 			s.seenChunks[id] = true
+ 
+ 			// Debug
+@@ -720,21 +895,28 @@ func (s *Stream) monitorExit() {
  	coder := s.coder
  	err := coder.Wait()
  
@@ -649,14 +1118,15 @@ index a8b699b..bab3bb1 100644
  	}
 diff --git a/go-vod/transcoder/stream_test.go b/go-vod/transcoder/stream_test.go
 new file mode 100644
-index 0000000..e44ebd7
+index 0000000..b00b105
 --- /dev/null
 +++ b/go-vod/transcoder/stream_test.go
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,135 @@
 +package transcoder
 +
 +import (
 +	"net/http/httptest"
++	"os"
 +	"os/exec"
 +	"strings"
 +	"testing"
@@ -755,5 +1225,35 @@ index 0000000..e44ebd7
 +	}
 +	if !s.canWaitForChunk(4) {
 +		t.Fatal("nearby chunk was not considered pending with an encoder")
++	}
++}
++
++func TestHLSTimestampArgsLeavesFMP4OffsetForFragmentNormalizer(t *testing.T) {
++	s := &Stream{c: &Config{HLSCodec: CODEC_HEVC}}
++	args := strings.Join(s.hlsTimestampArgs(360), " ")
++	if args != "-avoid_negative_ts disabled" {
++		t.Fatalf("unexpected fMP4 timestamp arguments: %s", args)
++	}
++}
++
++func TestHLSTimestampArgsLeavesMPEGTSUnshifted(t *testing.T) {
++	s := &Stream{c: &Config{HLSCodec: CODEC_H264}}
++	args := strings.Join(s.hlsTimestampArgs(360), " ")
++	if args != "-avoid_negative_ts disabled" {
++		t.Fatalf("unexpected MPEG-TS timestamp arguments: %s", args)
++	}
++}
++
++func TestEncoderInitPathPreservesPublishedInit(t *testing.T) {
++	tempDir := t.TempDir()
++	s := &Stream{m: &Manager{tempDir: tempDir}, quality: QUALITY_MAX}
++	if got := s.getEncoderInitPath(); got != s.getInitPath() {
++		t.Fatalf("first encoder init path = %s, want %s", got, s.getInitPath())
++	}
++	if err := os.WriteFile(s.getInitPath(), []byte("published"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	if got := s.getEncoderInitPath(); got != s.getTransientInitPath() {
++		t.Fatalf("restart encoder init path = %s, want %s", got, s.getTransientInitPath())
 +	}
 +}

@@ -16,9 +16,19 @@ When `GO_VOD_HLS_CODEC=hevc` is present, HLS output uses:
 - fMP4/CMAF-style `.m4s` segments and one init segment per rendition
 - `hvc1` sample-entry and RFC 6381 codec signaling
 - the wrapper's 12 Mbps target, 16 Mbps peak, and 32 Mbps VBV buffer
+- CQ 22 with spatial and temporal AQ at the default AQ strength of 8
+- single-pass encoding to preserve first-segment delivery time
 - forced IDR boundaries for reliable adaptive-quality switching
+- absolute fMP4 `tfdt` media timestamps across distant progress-bar seeks
+- continuous `mfhd` fragment sequence numbers across encoder restarts
+- an immutable published init segment whose cached timeline remains valid
 - a corrected static VOD playlist for short tails and HEVC fragment variance
 - H.264 MP4 output for Live Photos; the HEVC switch affects HLS only
+
+The quality defaults can be overridden with `GO_VOD_NVENC_CQ`,
+`GO_VOD_NVENC_SPATIAL_AQ`, `GO_VOD_NVENC_TEMPORAL_AQ`, and
+`GO_VOD_NVENC_AQ_STRENGTH`. AQ switches accept FFmpeg's `0` or `1`; AQ
+strength accepts 1 through 15.
 
 ## Rebuild and deploy
 
