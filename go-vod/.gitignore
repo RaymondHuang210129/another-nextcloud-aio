@@ -1,0 +1,3 @@
+# Legacy working reference; reproducible builds use the pinned upstream patch.
+/custom-src/
+

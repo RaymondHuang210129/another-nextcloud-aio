@@ -201,20 +201,27 @@ args=( "${filtered[@]}" )
 
 # Cap every go-vod NVENC HLS rendition. Without VBV limits, 4K CQ
 # encoding can exceed 60 Mb/s and starve browser video while audio continues.
-is_h264_nvenc=false
+is_nvenc=false
 have_bitrate=false
 have_maxrate=false
 have_bufsize=false
 for ((i=0;i<${#args[@]};i++)); do
-  [[ "${args[i]}" == "-c:v" && "${args[i+1]:-}" == "h264_nvenc" ]] && is_h264_nvenc=true
+  if [[ "${args[i]}" == "-c:v" ]] &&
+     [[ "${args[i+1]:-}" == "h264_nvenc" || "${args[i+1]:-}" == "hevc_nvenc" ]]; then
+    is_nvenc=true
+  fi
   [[ "${args[i]}" == "-b:v" || "${args[i]}" == "-b:v:0" ]] && have_bitrate=true
   [[ "${args[i]}" == "-maxrate" || "${args[i]}" == "-maxrate:v" || "${args[i]}" == "-maxrate:v:0" ]] && have_maxrate=true
   [[ "${args[i]}" == "-bufsize" || "${args[i]}" == "-bufsize:v" || "${args[i]}" == "-bufsize:v:0" ]] && have_bufsize=true
 done
-if $is_h264_nvenc; then
+if $is_nvenc; then
   $have_bitrate || insert_before_output args -b:v "${GO_VOD_MAX_BITRATE:-12M}"
   $have_maxrate || insert_before_output args -maxrate:v "${GO_VOD_MAX_MAXRATE:-16M}"
   $have_bufsize || insert_before_output args -bufsize:v "${GO_VOD_MAX_BUFSIZE:-32M}"
+
+  # HLS fMP4 renditions must be independently decodable after an adaptive
+  # quality switch. NVENC otherwise may encode forced keyframes as non-IDR.
+  insert_before_output args -forced-idr 1
 fi
 
 # 4) Force CFR 30 fps (output option)

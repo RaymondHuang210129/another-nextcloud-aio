@@ -1,0 +1,759 @@
+diff --git a/go-vod/transcoder/config.go b/go-vod/transcoder/config.go
+index 27daac5..084c887 100644
+--- a/go-vod/transcoder/config.go
++++ b/go-vod/transcoder/config.go
+@@ -6,6 +6,7 @@ import (
+ 	"log"
+ 	"os"
+ 	"os/exec"
++	"strings"
+ )
+ 
+ type Config struct {
+@@ -63,6 +64,10 @@ type Config struct {
+ 
+ 	// Use GOP size workaround for streaming (NVENC)
+ 	UseGopSize bool `json:"useGopSize"`
++
++	// HLSCodec is a server-local experimental override. Memories does not
++	// send it in the config payload, so GO_VOD_HLS_CODEC remains authoritative.
++	HLSCodec string `json:"-"`
+ }
+ 
+ func (c *Config) FromFile(path string) {
+@@ -83,6 +88,11 @@ func (c *Config) FromFile(path string) {
+ }
+ 
+ func (c *Config) AutoDetect() {
++	c.HLSCodec = strings.ToLower(os.Getenv("GO_VOD_HLS_CODEC"))
++	if c.HLSCodec != CODEC_HEVC {
++		c.HLSCodec = CODEC_H264
++	}
++
+ 	// Auto-detect ffmpeg and ffprobe paths
+ 	if c.FFmpeg == "" || c.FFprobe == "" {
+ 		ffmpeg, err := exec.LookPath("ffmpeg")
+diff --git a/go-vod/transcoder/manager.go b/go-vod/transcoder/manager.go
+index 7e0e2a6..af3cb9e 100644
+--- a/go-vod/transcoder/manager.go
++++ b/go-vod/transcoder/manager.go
+@@ -41,6 +41,7 @@ type ProbeVideoData struct {
+ 	CodecName string
+ 	BitRate   int
+ 	Rotation  int
++	HasAudio  bool
+ }
+ 
+ func NewManager(c *Config, path string, id string, close chan string) (*Manager, error) {
+@@ -213,17 +214,29 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request, chunk string
+ 		}
+ 	}
+ 
++	// fMP4 initialization segment
++	initSfx := "-init.mp4"
++	if m.c.HLSCodec == CODEC_HEVC && strings.HasSuffix(chunk, initSfx) {
++		quality := strings.TrimSuffix(chunk, initSfx)
++		if stream, ok := m.streams[quality]; ok {
++			return stream.ServeInit(w)
++		}
++	}
++
+ 	// Stream chunk
+-	tsSfx := ".ts"
+-	if strings.HasSuffix(chunk, tsSfx) {
+-		parts := strings.Split(chunk, "-")
++	segmentSfx := ".ts"
++	if m.c.HLSCodec == CODEC_HEVC {
++		segmentSfx = ".m4s"
++	}
++	if strings.HasSuffix(chunk, segmentSfx) {
++		parts := strings.SplitN(chunk, "-", 2)
+ 		if len(parts) != 2 {
+ 			w.WriteHeader(http.StatusBadRequest)
+ 			return nil
+ 		}
+ 
+ 		quality := parts[0]
+-		chunkIdStr := strings.TrimSuffix(parts[1], tsSfx)
++		chunkIdStr := strings.TrimSuffix(parts[1], segmentSfx)
+ 		chunkId, err := strconv.Atoi(chunkIdStr)
+ 		if err != nil {
+ 			w.WriteHeader(http.StatusBadRequest)
+@@ -254,6 +267,10 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request, chunk string
+ func (m *Manager) ServeIndex(w http.ResponseWriter, r *http.Request) error {
+ 	WriteM3U8ContentType(w)
+ 	w.Write([]byte("#EXTM3U\n"))
++	if m.c.HLSCodec == CODEC_HEVC {
++		w.Write([]byte("#EXT-X-VERSION:7\n"))
++		w.Write([]byte("#EXT-X-INDEPENDENT-SEGMENTS\n"))
++	}
+ 
+ 	// get sorted streams by bitrate
+ 	streams := make([]*Stream, 0)
+@@ -268,7 +285,24 @@ func (m *Manager) ServeIndex(w http.ResponseWriter, r *http.Request) error {
+ 	// Write all streams
+ 	query := GetQueryString(r)
+ 	for _, stream := range streams {
+-		s := fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,FRAME-RATE=%d\n%s.m3u8%s\n", stream.bitrate, stream.width, stream.height, m.probe.FrameRate, stream.quality, query)
++		codecs := ""
++		bandwidth := stream.bitrate
++		if m.c.HLSCodec == CODEC_HEVC {
++			codecList := stream.hevcCodecString()
++			if m.probe.HasAudio {
++				codecList += ",mp4a.40.2"
++			}
++			codecs = fmt.Sprintf(",CODECS=\"%s\"", codecList)
++			// The wrapper caps video at 16 Mbps. Include headroom for AAC.
++			if bandwidth > 16256000 {
++				bandwidth = 16256000
++			}
++		}
++		frameRate := m.probe.FrameRate
++		if frameRate > 30 {
++			frameRate = 30
++		}
++		s := fmt.Sprintf("#EXT-X-STREAM-INF:BANDWIDTH=%d,RESOLUTION=%dx%d,FRAME-RATE=%d%s\n%s.m3u8%s\n", bandwidth, stream.width, stream.height, frameRate, codecs, stream.quality, query)
+ 		w.Write([]byte(s))
+ 	}
+ 	return nil
+@@ -281,7 +315,6 @@ func (m *Manager) ffprobe() error {
+ 
+ 		// Show everything
+ 		"-show_entries", "format:stream",
+-		"-select_streams", "v", // Video stream only, we're not interested in audio
+ 
+ 		"-of", "json",
+ 		m.path,
+@@ -301,20 +334,22 @@ func (m *Manager) ffprobe() error {
+ 		return err
+ 	}
+ 
++	type probeStream struct {
++		CodecType    string `json:"codec_type"`
++		Width        int    `json:"width"`
++		Height       int    `json:"height"`
++		Duration     string `json:"duration"`
++		FrameRate    string `json:"avg_frame_rate"`
++		CodecName    string `json:"codec_name"`
++		BitRate      string `json:"bit_rate"`
++		SideDataList []struct {
++			SideDataType string `json:"side_data_type"`
++			Rotation     int    `json:"rotation"`
++		} `json:"side_data_list"`
++	}
+ 	out := struct {
+-		Streams []struct {
+-			Width        int    `json:"width"`
+-			Height       int    `json:"height"`
+-			Duration     string `json:"duration"`
+-			FrameRate    string `json:"avg_frame_rate"`
+-			CodecName    string `json:"codec_name"`
+-			BitRate      string `json:"bit_rate"`
+-			SideDataList []struct {
+-				SideDataType string `json:"side_data_type"`
+-				Rotation     int    `json:"rotation"`
+-			} `json:"side_data_list"`
+-		} `json:"streams"`
+-		Format struct {
++		Streams []probeStream `json:"streams"`
++		Format  struct {
+ 			Duration string `json:"duration"`
+ 		} `json:"format"`
+ 	}{}
+@@ -323,19 +358,28 @@ func (m *Manager) ffprobe() error {
+ 		return err
+ 	}
+ 
+-	if len(out.Streams) == 0 {
++	var video *probeStream
++	hasAudio := false
++	for i := range out.Streams {
++		if out.Streams[i].CodecType == "audio" {
++			hasAudio = true
++		} else if out.Streams[i].CodecType == "video" && video == nil {
++			video = &out.Streams[i]
++		}
++	}
++	if video == nil {
+ 		return errors.New("no video streams found")
+ 	}
+ 
+ 	var duration time.Duration
+-	if out.Streams[0].Duration != "" {
+-		duration, _ = time.ParseDuration(out.Streams[0].Duration + "s")
++	if video.Duration != "" {
++		duration, _ = time.ParseDuration(video.Duration + "s")
+ 	} else if out.Format.Duration != "" {
+ 		duration, _ = time.ParseDuration(out.Format.Duration + "s")
+ 	}
+ 
+ 	// FrameRate is a fraction string
+-	frac := strings.Split(out.Streams[0].FrameRate, "/")
++	frac := strings.Split(video.FrameRate, "/")
+ 	if len(frac) != 2 {
+ 		frac = []string{"30", "1"}
+ 	}
+@@ -348,27 +392,28 @@ func (m *Manager) ffprobe() error {
+ 	frameRate := float64(num) / float64(den)
+ 
+ 	// BitRate is a string
+-	bitRate, err := strconv.Atoi(out.Streams[0].BitRate)
++	bitRate, err := strconv.Atoi(video.BitRate)
+ 	if err != nil {
+ 		bitRate = 5000000
+ 	}
+ 
+ 	// Get rotation from side data
+ 	rotation := 0
+-	for _, sideData := range out.Streams[0].SideDataList {
++	for _, sideData := range video.SideDataList {
+ 		if sideData.SideDataType == "Display Matrix" {
+ 			rotation = sideData.Rotation
+ 		}
+ 	}
+ 
+ 	m.probe = &ProbeVideoData{
+-		Width:     out.Streams[0].Width,
+-		Height:    out.Streams[0].Height,
++		Width:     video.Width,
++		Height:    video.Height,
+ 		Duration:  duration,
+ 		FrameRate: int(frameRate),
+-		CodecName: out.Streams[0].CodecName,
++		CodecName: video.CodecName,
+ 		BitRate:   bitRate,
+ 		Rotation:  rotation,
++		HasAudio:  hasAudio,
+ 	}
+ 
+ 	return nil
+diff --git a/go-vod/transcoder/stream.go b/go-vod/transcoder/stream.go
+index a8b699b..bab3bb1 100644
+--- a/go-vod/transcoder/stream.go
++++ b/go-vod/transcoder/stream.go
+@@ -8,6 +8,7 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"os/exec"
++	"path/filepath"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -18,13 +19,15 @@ import (
+ const (
+ 	BLANK = ""
+ 
+-	ENCODER_COPY  = "copy"
+-	ENCODER_X264  = "libx264"
+-	ENCODER_VAAPI = "h264_vaapi"
+-	ENCODER_NVENC = "h264_nvenc"
++	ENCODER_COPY       = "copy"
++	ENCODER_X264       = "libx264"
++	ENCODER_VAAPI      = "h264_vaapi"
++	ENCODER_NVENC      = "h264_nvenc"
++	ENCODER_HEVC_NVENC = "hevc_nvenc"
+ 
+ 	QUALITY_MAX = "max"
+ 	CODEC_H264  = "h264"
++	CODEC_HEVC  = "hevc"
+ )
+ 
+ type Stream struct {
+@@ -114,26 +117,50 @@ func (s *Stream) Stop() {
+ func (s *Stream) ServeList(w http.ResponseWriter, r *http.Request) error {
+ 	WriteM3U8ContentType(w)
+ 	w.Write([]byte("#EXTM3U\n"))
+-	w.Write([]byte("#EXT-X-VERSION:4\n"))
++	if s.usesFMP4() {
++		w.Write([]byte("#EXT-X-VERSION:7\n"))
++	} else {
++		w.Write([]byte("#EXT-X-VERSION:4\n"))
++	}
+ 	w.Write([]byte("#EXT-X-MEDIA-SEQUENCE:0\n"))
+ 	w.Write([]byte("#EXT-X-PLAYLIST-TYPE:VOD\n"))
+-	w.Write([]byte(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", s.c.ChunkSize)))
++	targetDuration := s.c.ChunkSize
++	if s.usesFMP4() {
++		targetDuration++
++	}
++	w.Write([]byte(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration)))
+ 
+ 	query := GetQueryString(r)
+-
+-	duration := s.m.probe.Duration.Seconds()
+-	i := 0
+-	for duration > 0 {
+-		size := float64(s.c.ChunkSize)
+-		if duration < size {
+-			size = duration
++	if s.usesFMP4() {
++		w.Write([]byte("#EXT-X-INDEPENDENT-SEGMENTS\n"))
++		w.Write([]byte(fmt.Sprintf("#EXT-X-MAP:URI=\"%s-init.mp4%s\"\n", s.quality, query)))
++	}
++
++	chunkDuration := time.Duration(s.c.ChunkSize) * time.Second
++	fullChunks := int(s.m.probe.Duration / chunkDuration)
++	tail := s.m.probe.Duration % chunkDuration
++
++	// NVENC/HLS can fold a very short tail into the preceding fragment. Do
++	// the same in the static playlist instead of advertising a fragment that
++	// ffmpeg never writes. The final EXTINF still preserves total duration.
++	mergeTail := fullChunks > 0 && tail > 0 && tail < 500*time.Millisecond
++	numChunks := fullChunks
++	if tail > 0 && !mergeTail {
++		numChunks++
++	}
++
++	for i := 0; i < numChunks; i++ {
++		size := chunkDuration
++		if i == numChunks-1 {
++			if mergeTail {
++				size += tail
++			} else if tail > 0 {
++				size = tail
++			}
+ 		}
+ 
+-		w.Write([]byte(fmt.Sprintf("#EXTINF:%.3f, nodesc\n", size)))
+-		w.Write([]byte(fmt.Sprintf("%s-%06d.ts%s\n", s.quality, i, query)))
+-
+-		duration -= float64(s.c.ChunkSize)
+-		i++
++		w.Write([]byte(fmt.Sprintf("#EXTINF:%.3f, nodesc\n", size.Seconds())))
++		w.Write([]byte(fmt.Sprintf("%s-%06d%s%s\n", s.quality, i, s.segmentExtension(), query)))
+ 	}
+ 
+ 	w.Write([]byte("#EXT-X-ENDLIST\n"))
+@@ -141,6 +168,39 @@ func (s *Stream) ServeList(w http.ResponseWriter, r *http.Request) error {
+ 	return nil
+ }
+ 
++func (s *Stream) ServeInit(w http.ResponseWriter) error {
++	deadline := time.Now().Add(10 * time.Second)
++
++	s.mutex.Lock()
++	if _, err := os.Stat(s.getInitPath()); err != nil && s.coder == nil {
++		s.clear()
++		s.createChunk(0)
++		s.goal = s.c.GoalBufferMax
++		s.transcode(0)
++	}
++	s.inactive = 0
++	s.mutex.Unlock()
++
++	for {
++		info, err := os.Stat(s.getInitPath())
++		if err == nil && info.Size() > 0 {
++			f, err := os.Open(s.getInitPath())
++			if err != nil {
++				continue
++			}
++			defer f.Close()
++			w.Header().Set("Content-Type", "video/mp4")
++			_, err = io.Copy(w, f)
++			return err
++		}
++		if time.Now().After(deadline) {
++			w.WriteHeader(http.StatusRequestTimeout)
++			return nil
++		}
++		time.Sleep(25 * time.Millisecond)
++	}
++}
++
+ func (s *Stream) ServeChunk(w http.ResponseWriter, id int) error {
+ 	s.mutex.Lock()
+ 	defer s.mutex.Unlock()
+@@ -155,20 +215,13 @@ func (s *Stream) ServeChunk(w http.ResponseWriter, id int) error {
+ 			s.returnChunk(w, chunk)
+ 			return nil
+ 		}
+-
+-		// Still waiting on transcoder
+-		s.waitForChunk(w, chunk)
+-		return nil
+ 	}
+ 
+-	// Will have this soon enough
+-	foundBehind := false
+-	for i := id - 1; i > id-s.c.LookBehind && i >= 0; i-- {
+-		if _, ok := s.chunks[i]; ok {
+-			foundBehind = true
+-		}
+-	}
+-	if foundBehind {
++	// Only wait for an unfinished or nearby chunk while an encoder is still
++	// running. At EOF ffmpeg may exit just before a short final segment. In
++	// that case, waiting can never succeed; restart close to the requested
++	// segment instead.
++	if s.canWaitForChunk(id) {
+ 		// Make sure the chunk exists
+ 		chunk := s.createChunk(id)
+ 
+@@ -182,6 +235,24 @@ func (s *Stream) ServeChunk(w http.ResponseWriter, id int) error {
+ 	return nil
+ }
+ 
++func (s *Stream) canWaitForChunk(id int) bool {
++	if s.coder == nil {
++		return false
++	}
++
++	if _, ok := s.chunks[id]; ok {
++		return true
++	}
++
++	for i := id - 1; i > id-s.c.LookBehind && i >= 0; i-- {
++		if _, ok := s.chunks[i]; ok {
++			return true
++		}
++	}
++
++	return false
++}
++
+ func (s *Stream) ServeFullVideo(w http.ResponseWriter, r *http.Request) error {
+ 	args := s.transcodeArgs(0, false)
+ 
+@@ -271,7 +342,7 @@ func (s *Stream) pruneChunk(id int) {
+ 	delete(s.chunks, id)
+ 
+ 	// Remove file
+-	filename := s.getTsPath(id)
++	filename := s.getSegmentPath(id)
+ 	os.Remove(filename)
+ }
+ 
+@@ -281,7 +352,7 @@ func (s *Stream) returnChunk(w http.ResponseWriter, chunk *Chunk) {
+ 	defer s.mutex.Lock()
+ 
+ 	// Read file and write to response
+-	filename := s.getTsPath(chunk.id)
++	filename := s.getSegmentPath(chunk.id)
+ 	f, err := os.Open(filename)
+ 	if err != nil {
+ 		log.Println(err)
+@@ -289,7 +360,11 @@ func (s *Stream) returnChunk(w http.ResponseWriter, chunk *Chunk) {
+ 		return
+ 	}
+ 	defer f.Close()
+-	w.Header().Set("Content-Type", "video/MP2T")
++	if s.usesFMP4() {
++		w.Header().Set("Content-Type", "video/mp4")
++	} else {
++		w.Header().Set("Content-Type", "video/MP2T")
++	}
+ 	io.Copy(w, f)
+ }
+ 
+@@ -374,6 +449,9 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
+ 		args = append(args, strings.Split(extra, " ")...)
+ 	} else if s.c.NVENC {
+ 		CV = ENCODER_NVENC
++		if isHls && s.c.HLSCodec == CODEC_HEVC {
++			CV = ENCODER_HEVC_NVENC
++		}
+ 		extra := "-hwaccel cuda"
+ 		args = append(args, strings.Split(extra, " ")...)
+ 	}
+@@ -400,7 +478,7 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
+ 		format = "format=nv12|vaapi,hwupload"
+ 		scaler = "scale_vaapi"
+ 		scalerArgs = append(scalerArgs, "format=nv12")
+-	} else if CV == ENCODER_NVENC {
++	} else if CV == ENCODER_NVENC || CV == ENCODER_HEVC_NVENC {
+ 		format = "format=nv12|cuda,hwupload"
+ 		scaler = fmt.Sprintf("scale_%s", s.c.NVENCScale)
+ 
+@@ -435,7 +513,7 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
+ 			transposer := "transpose"
+ 			if CV == ENCODER_VAAPI {
+ 				transposer = "transpose_vaapi"
+-			} else if CV == ENCODER_NVENC {
++			} else if CV == ENCODER_NVENC || CV == ENCODER_HEVC_NVENC {
+ 				transposer = fmt.Sprintf("transpose_%s", s.c.NVENCScale)
+ 			}
+ 
+@@ -487,14 +565,24 @@ func (s *Stream) transcodeArgs(startAt float64, isHls bool) []string {
+ 		if s.c.VAAPILowPower {
+ 			args = append(args, []string{"-low_power", "1"}...)
+ 		}
+-	} else if CV == ENCODER_NVENC {
++	} else if CV == ENCODER_NVENC || CV == ENCODER_HEVC_NVENC {
++		tune := "ll"
++		if CV == ENCODER_HEVC_NVENC {
++			tune = "hq"
++		}
+ 		args = append(args, []string{
+ 			"-preset", "p6",
+-			"-tune", "ll",
++			"-tune", tune,
+ 			"-rc", "vbr",
+ 			"-rc-lookahead", "30",
+ 			"-cq", fmt.Sprintf("%d", s.c.QF),
+ 		}...)
++		if CV == ENCODER_HEVC_NVENC {
++			args = append(args, []string{
++				"-profile:v", "main",
++				"-tag:v", "hvc1",
++			}...)
++		}
+ 
+ 		if s.c.NVENCTemporalAQ {
+ 			args = append(args, []string{"-temporal-aq", "1"}...)
+@@ -526,6 +614,10 @@ func (s *Stream) transcode(startId int) {
+ 	args := s.transcodeArgs(startAt, true)
+ 
+ 	// Segmenting specs
++	segmentType := "mpegts"
++	if s.usesFMP4() {
++		segmentType = "fmp4"
++	}
+ 	args = append(args, []string{
+ 		"-start_number", fmt.Sprintf("%d", startId),
+ 		"-avoid_negative_ts", "disabled",
+@@ -547,9 +639,12 @@ func (s *Stream) transcode(startId int) {
+ 		"-hls_flags", "split_by_time",
+ 		"-hls_time", fmt.Sprintf("%d", s.c.ChunkSize),
+ 
+-		"-hls_segment_type", "mpegts",
+-		"-hls_segment_filename", s.getTsPath(-1),
++		"-hls_segment_type", segmentType,
++		"-hls_segment_filename", s.getSegmentPath(-1),
+ 	}...)
++	if s.usesFMP4() {
++		args = append(args, "-hls_fmp4_init_filename", s.getInitPath())
++	}
+ 
+ 	// Keyframe specs
+ 	if s.c.UseGopSize && s.m.probe.FrameRate > 0 {
+@@ -616,11 +711,56 @@ func (s *Stream) checkGoal(id int) {
+ 	}
+ }
+ 
+-func (s *Stream) getTsPath(id int) string {
++func (s *Stream) usesFMP4() bool {
++	return s.c.HLSCodec == CODEC_HEVC
++}
++
++func (s *Stream) segmentExtension() string {
++	if s.usesFMP4() {
++		return ".m4s"
++	}
++	return ".ts"
++}
++
++func (s *Stream) getSegmentPath(id int) string {
+ 	if id == -1 {
+-		return fmt.Sprintf("%s/%s-%%06d.ts", s.m.tempDir, s.quality)
++		return fmt.Sprintf("%s/%s-%%06d%s", s.m.tempDir, s.quality, s.segmentExtension())
+ 	}
+-	return fmt.Sprintf("%s/%s-%06d.ts", s.m.tempDir, s.quality, id)
++	return fmt.Sprintf("%s/%s-%06d%s", s.m.tempDir, s.quality, id, s.segmentExtension())
++}
++
++func (s *Stream) getInitPath() string {
++	return fmt.Sprintf("%s/%s-init.mp4", s.m.tempDir, s.quality)
++}
++
++func (s *Stream) hevcLevel() string {
++	switch {
++	case s.height <= 480:
++		return "3.0"
++	case s.height <= 720:
++		return "3.1"
++	case s.height <= 1080:
++		return "4.0"
++	case s.height <= 1440:
++		return "5.0"
++	case s.height <= 2160:
++		return "5.0"
++	default:
++		return "5.1"
++	}
++}
++
++func (s *Stream) hevcCodecString() string {
++	levelIDC := map[string]string{
++		"3.0": "90",
++		"3.1": "93",
++		"4.0": "120",
++		"5.0": "150",
++		"5.1": "153",
++	}[s.hevcLevel()]
++	// RTX NVENC Main emits compatibility flags 0x40000000 and constraint
++	// flags 0x900000000000, represented per RFC 6381 as .2 and .90.
++	return fmt.Sprintf("hvc1.1.2.L%s.90", levelIDC)
+ }
+ 
+ // Separate goroutine
+@@ -651,12 +791,15 @@ func (s *Stream) monitorTranscodeOutput(cmdStdOut io.ReadCloser, startAt float64
+ 
+ 		l := string(line)
+ 
+-		if strings.Contains(l, ".ts") {
+-			// 1080p-000003.ts
+-			idx := strings.Split(strings.Split(l, "-")[1], ".")[0]
++		if strings.Contains(l, s.segmentExtension()) {
++			// 1080p-000003.ts or 1080p-000003.m4s
++			name := filepath.Base(strings.TrimSpace(l))
++			stem := strings.TrimSuffix(name, s.segmentExtension())
++			idx := strings.TrimPrefix(stem, s.quality+"-")
+ 			id, err := strconv.Atoi(idx)
+ 			if err != nil {
+ 				log.Println("Error parsing chunk id")
++				continue
+ 			}
+ 
+ 			if s.seenChunks[id] {
+@@ -720,21 +863,28 @@ func (s *Stream) monitorExit() {
+ 	coder := s.coder
+ 	err := coder.Wait()
+ 
+-	// Try to get exit status
++	exitcode := 0
+ 	if exitError, ok := err.(*exec.ExitError); ok {
+-		exitcode := exitError.ExitCode()
+-		log.Printf("%s-%s: ffmpeg exited with status: %d", s.m.id, s.quality, exitcode)
++		exitcode = exitError.ExitCode()
++	} else if err != nil {
++		exitcode = -1
++	}
++	log.Printf("%s-%s: ffmpeg exited with status: %d", s.m.id, s.quality, exitcode)
+ 
+-		s.mutex.Lock()
+-		defer s.mutex.Unlock()
++	s.mutex.Lock()
++	defer s.mutex.Unlock()
++	if s.coder != coder {
++		return
++	}
+ 
+-		// If error code is >0, there was an error in transcoding
+-		if exitcode > 0 && s.coder == coder {
+-			// Notify all outstanding chunks
+-			for _, chunk := range s.chunks {
+-				for _, n := range chunk.notifs {
+-					n <- true
+-				}
++	// A normally exited process is not resumable. Clear the pointer and wake
++	// any request still waiting for a segment at EOF.
++	s.coder = nil
++	for _, chunk := range s.chunks {
++		for _, n := range chunk.notifs {
++			select {
++			case n <- true:
++			default:
+ 			}
+ 		}
+ 	}
+diff --git a/go-vod/transcoder/stream_test.go b/go-vod/transcoder/stream_test.go
+new file mode 100644
+index 0000000..e44ebd7
+--- /dev/null
++++ b/go-vod/transcoder/stream_test.go
+@@ -0,0 +1,104 @@
++package transcoder
++
++import (
++	"net/http/httptest"
++	"os/exec"
++	"strings"
++	"testing"
++	"time"
++)
++
++func renderTestPlaylist(t *testing.T, duration time.Duration) string {
++	t.Helper()
++	c := &Config{ChunkSize: 3, HLSCodec: CODEC_HEVC}
++	m := &Manager{c: c, probe: &ProbeVideoData{Duration: duration}}
++	s := &Stream{c: c, m: m, quality: QUALITY_MAX}
++	recorder := httptest.NewRecorder()
++	request := httptest.NewRequest("GET", "/max.m3u8", nil)
++	if err := s.ServeList(recorder, request); err != nil {
++		t.Fatal(err)
++	}
++	return recorder.Body.String()
++}
++
++func TestServeListMergesShortFinalTail(t *testing.T) {
++	playlist := renderTestPlaylist(t, 189353333*time.Microsecond)
++	if !strings.Contains(playlist, "#EXT-X-TARGETDURATION:4") {
++		t.Fatalf("HEVC target duration does not allow fragment variance:\n%s", playlist)
++	}
++	if !strings.Contains(playlist, "#EXTINF:3.353, nodesc\nmax-000062.m4s") {
++		t.Fatalf("playlist did not merge short final tail into segment 62:\n%s", playlist)
++	}
++	if strings.Contains(playlist, "max-000063.m4s") {
++		t.Fatalf("playlist advertised a short segment ffmpeg may not create:\n%s", playlist)
++	}
++}
++
++func TestServeListKeepsSubstantialFinalTail(t *testing.T) {
++	playlist := renderTestPlaylist(t, 190200000*time.Microsecond)
++	if !strings.Contains(playlist, "#EXTINF:1.200, nodesc\nmax-000063.m4s") {
++		t.Fatalf("playlist dropped substantial final tail:\n%s", playlist)
++	}
++}
++
++func TestServeListExactBoundary(t *testing.T) {
++	playlist := renderTestPlaylist(t, 189*time.Second)
++	if !strings.Contains(playlist, "#EXTINF:3.000, nodesc\nmax-000062.m4s") {
++		t.Fatalf("playlist dropped exact-boundary segment 62:\n%s", playlist)
++	}
++	if strings.Contains(playlist, "max-000063.m4s") {
++		t.Fatal("playlist added a segment beyond an exact duration boundary")
++	}
++}
++
++func TestMonitorExitClearsNormalProcess(t *testing.T) {
++	coder := exec.Command("true")
++	if err := coder.Start(); err != nil {
++		t.Fatal(err)
++	}
++	notif := make(chan bool, 1)
++	s := &Stream{
++		m:       &Manager{id: "test"},
++		quality: QUALITY_MAX,
++		coder:   coder,
++		chunks: map[int]*Chunk{
++			0: {id: 0, notifs: []chan bool{notif}},
++		},
++	}
++
++	s.monitorExit()
++
++	if s.coder != nil {
++		t.Fatal("normally exited encoder remained resumable")
++	}
++	select {
++	case <-notif:
++	default:
++		t.Fatal("waiting chunk was not notified when encoder exited")
++	}
++}
++
++func TestCanWaitForChunkRequiresRunningEncoder(t *testing.T) {
++	s := &Stream{
++		c: &Config{LookBehind: 3},
++		chunks: map[int]*Chunk{
++			2: {id: 2, done: true},
++			3: {id: 3},
++		},
++	}
++
++	if s.canWaitForChunk(3) {
++		t.Fatal("unfinished chunk was considered pending without an encoder")
++	}
++	if s.canWaitForChunk(4) {
++		t.Fatal("nearby chunk was considered pending without an encoder")
++	}
++
++	s.coder = exec.Command("true")
++	if !s.canWaitForChunk(3) {
++		t.Fatal("unfinished chunk was not considered pending with an encoder")
++	}
++	if !s.canWaitForChunk(4) {
++		t.Fatal("nearby chunk was not considered pending with an encoder")
++	}
++}

@@ -1,0 +1,40 @@
+ARG GO_BUILDER_IMAGE=docker.io/library/golang:1.24-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac
+ARG GO_VOD_RUNTIME_IMAGE=docker.io/radialapps/go-vod:latest@sha256:759ef1ee8a16f30793822b1a00c78962e3c34ff3012d9b55e8332edd1815b3ab
+
+FROM ${GO_BUILDER_IMAGE} AS go-vod-builder
+
+ARG GO_VOD_REPOSITORY=https://github.com/pulsejet/memories.git
+ARG GO_VOD_COMMIT=321d93cbafed298c6c3c662e41b8c622c6f8e955
+
+WORKDIR /src
+RUN git init memories \
+    && git -C memories remote add origin "${GO_VOD_REPOSITORY}" \
+    && git -C memories fetch --depth=1 origin "${GO_VOD_COMMIT}" \
+    && git -C memories checkout --detach FETCH_HEAD \
+    && test "$(git -C memories rev-parse HEAD)" = "${GO_VOD_COMMIT}"
+
+COPY patches/go-vod-0.2.6-custom.patch /tmp/go-vod-custom.patch
+RUN git -C /src/memories apply --check /tmp/go-vod-custom.patch \
+    && git -C /src/memories apply /tmp/go-vod-custom.patch
+
+WORKDIR /src/memories/go-vod
+RUN unformatted="$(gofmt -l main.go transcoder/*.go)" \
+    && test -z "${unformatted}" \
+    && go test ./... \
+    && mkdir -p /out \
+    && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/go-vod-custom .
+
+FROM ${GO_VOD_RUNTIME_IMAGE}
+
+ARG GO_VOD_COMMIT=321d93cbafed298c6c3c662e41b8c622c6f8e955
+LABEL org.opencontainers.image.source="https://github.com/pulsejet/memories" \
+      org.opencontainers.image.revision="${GO_VOD_COMMIT}" \
+      local.go-vod.patch="go-vod-0.2.6-custom.patch"
+
+COPY --from=go-vod-builder --chmod=0755 /out/go-vod-custom /app/go-vod-custom
+COPY --chmod=0755 build-ffmpeg-nvidia.sh /app/build-ffmpeg-nvidia.sh
+COPY --chmod=0755 ffmpeg-wrapper /app/ffmpeg-wrapper
+COPY patches/ffmpeg-transpose-cuda.patch /app/patches/ffmpeg-transpose-cuda.patch
+COPY patches/README.md /app/patches/README.md
+
+ENTRYPOINT ["/app/build-ffmpeg-nvidia.sh"]
